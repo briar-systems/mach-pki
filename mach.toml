@@ -1,5 +1,5 @@
 [project]
-id = "example"
+id = "pki"
 version = "0.1.0"
 mach = "^6.8"
 src = "src"
@@ -30,10 +30,10 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
-[artifact.example]
+[artifact.pki]
 kind = "bin"
-entry = "bin/example.mach"
-out = "bin/example{artifact.suffix}"
+entry = "bin/pki.mach"
+out = "bin/pki{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []
