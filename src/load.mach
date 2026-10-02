@@ -4,12 +4,12 @@ use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.encoding.pem;
 use crypto.secret;
+use pki.cert;
+use pki.x509;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use pki.cert;
-use pki.x509;
 
 val BEGIN_CERTIFICATE: [27]u8 = [27]u8{
     '-', '-', '-', '-', '-', 'B', 'E', 'G', 'I', 'N', ' ',

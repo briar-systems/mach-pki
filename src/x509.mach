@@ -3,6 +3,7 @@
 use crypto.contracts;
 use crypto.encoding.der;
 use crypto.encoding.keys;
+use pki.name;
 use std.chrono.date;
 use std.encoding.base64;
 use std.text.utf8;
@@ -11,7 +12,6 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
-use pki.name;
 
 pub val MAX_SERIAL_SIZE:    usize = 20;
 pub val MAX_PATH_LENGTH:    usize = 64;
@@ -38,9 +38,42 @@ pub val KEY_USAGE_CRL_SIGN:           u16 = 1 << 6;
 pub val KEY_USAGE_ENCIPHER_ONLY:      u16 = 1 << 7;
 pub val KEY_USAGE_DECIPHER_ONLY:      u16 = 1 << 8;
 
-pub val PURPOSE_SERVER_AUTH: u8 = 1 << 0;
-pub val PURPOSE_CLIENT_AUTH: u8 = 1 << 1;
-pub val PURPOSE_ANY:         u8 = 1 << 2;
+# extended key usage purposes, as object identifier content
+pub val EKU_SERVER_AUTH: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+};
+pub val EKU_CLIENT_AUTH: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02,
+};
+pub val EKU_CODE_SIGNING: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03,
+};
+pub val EKU_EMAIL_PROTECTION: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x04,
+};
+pub val EKU_TIME_STAMPING: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08,
+};
+# rfc 9336
+pub val EKU_DOCUMENT_SIGNING: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x24,
+};
+pub val EKU_ANY: [4]u8 = [4]u8{0x55, 0x1d, 0x25, 0x00};
+
+# a critical extension parse_with leaves to its caller, and what extension finds
+pub rec Extension {
+    critical: bool;
+    value:    contracts.Bytes;
+}
+
+pub rec Options {
+    # the relaxations rfc 5280 grants a configured trust anchor
+    trust_anchor: bool;
+    # critical extensions the caller processes itself, as object identifier
+    # content. any other critical extension this parser does not know is refused
+    critical:     *contracts.Bytes;
+    critical_len: usize;
+}
 
 pub rec Extensions {
     basic_constraints_present:   bool;
@@ -53,7 +86,7 @@ pub rec Extensions {
     key_usage:                   u16;
     extended_key_usage_present:  bool;
     extended_key_usage_critical: bool;
-    purposes:                    u8;
+    extended_key_usage:          contracts.Bytes;
     subject_alt_name_present:    bool;
     subject_alt_name_critical:   bool;
     subject_alt_name:            contracts.Bytes;
@@ -64,8 +97,8 @@ pub rec Extensions {
     subject_key_id:              contracts.Bytes;
     authority_key_id_present:    bool;
     authority_key_id:            contracts.Bytes;
-    acme_identifier_present:     bool;
-    acme_identifier:             contracts.Bytes;
+    # every extension, as the encoded sequence
+    encoded: contracts.Bytes;
 }
 
 pub rec Certificate {
@@ -96,7 +129,7 @@ fun empty_extensions() Extensions {
         key_usage:                   0,
         extended_key_usage_present:  false,
         extended_key_usage_critical: false,
-        purposes:                    0,
+        extended_key_usage:          contracts.Bytes{data: nil, len: 0},
         subject_alt_name_present:    false,
         subject_alt_name_critical:   false,
         subject_alt_name:            contracts.Bytes{data: nil, len: 0},
@@ -107,8 +140,7 @@ fun empty_extensions() Extensions {
         subject_key_id:              contracts.Bytes{data: nil, len: 0},
         authority_key_id_present:    false,
         authority_key_id:            contracts.Bytes{data: nil, len: 0},
-        acme_identifier_present:     false,
-        acme_identifier:             contracts.Bytes{data: nil, len: 0},
+        encoded:                     contracts.Bytes{data: nil, len: 0},
     };
 }
 
@@ -147,13 +179,6 @@ val OID_NAME_CONSTRAINTS:   [3]u8 = [3]u8{0x55, 0x1d, 0x1e};
 val OID_SUBJECT_KEY_ID:     [3]u8 = [3]u8{0x55, 0x1d, 0x0e};
 val OID_AUTHORITY_KEY_ID:   [3]u8 = [3]u8{0x55, 0x1d, 0x23};
 
-val OID_SERVER_AUTH: [8]u8 = [8]u8{
-    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
-};
-val OID_CLIENT_AUTH: [8]u8 = [8]u8{
-    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02,
-};
-val OID_ANY_PURPOSE:      [4]u8  = [4]u8{0x55, 0x1d, 0x25, 0x00};
 val OID_DOMAIN_COMPONENT: [10]u8 = [10]u8{
     0x09, 0x92, 0x26, 0x89, 0x93, 0xf2, 0x2c, 0x64, 0x01, 0x19,
 };
@@ -756,29 +781,25 @@ fun parse_extended_key_usage(input: contracts.Bytes,
     var root: der.Element;
     if (output == nil || !one_element(input, der.SEQUENCE, ?root) ||
         root.content.len == 0) { ret false; }
-    var parent: der.Cursor = der.cursor(input);
-    var body:   der.Cursor;
-    der.enter(?parent, ?root, ?body);
-    var purposes: u8 = 0;
+    var body:  der.Cursor = der.cursor(root.content);
+    var count: usize      = 0;
     for (!der.complete(?body)) {
         var oid: der.Element;
         if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID) {
             ret false;
         }
-        var purpose: u8 = 0;
-        if (oid_equal(oid.content, (?OID_SERVER_AUTH[0]), 8)) {
-            purpose = PURPOSE_SERVER_AUTH;
+        # a purpose listed twice is refused
+        var prior: der.Cursor = der.cursor(root.content);
+        var i:     usize      = 0;
+        for (i < count) {
+            var seen: der.Element;
+            if (der.next(?prior, ?seen) != contracts.OK ||
+                bytes_equal(seen.content, oid.content)) { ret false; }
+            i = i + 1;
         }
-        or (oid_equal(oid.content, (?OID_CLIENT_AUTH[0]), 8)) {
-            purpose = PURPOSE_CLIENT_AUTH;
-        }
-        or (oid_equal(oid.content, (?OID_ANY_PURPOSE[0]), 4)) {
-            purpose = PURPOSE_ANY;
-        }
-        if (purpose != 0 && (purposes & purpose) != 0) { ret false; }
-        purposes = purposes | purpose;
+        count = count + 1;
     }
-    output.purposes = purposes;
+    output.extended_key_usage = input;
     ret true;
 }
 
@@ -1000,11 +1021,19 @@ fun extension_count(input: contracts.Bytes, expected: contracts.Bytes) usize {
     ret count;
 }
 
-val OID_ACME_IDENTIFIER: [8]u8 = [8]u8{0x2b, 0x06, 0x01, 0x05, 0x05, 0x07,
-    0x01, 0x1f};
+fun handled(options: *Options, oid: contracts.Bytes) bool {
+    if (options.critical == nil) { ret false; }
+    var i: usize = 0;
+    for (i < options.critical_len) {
+        if (bytes_equal(options.critical[i], oid)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
 
 fun parse_extensions(element: *der.Element, output: *Extensions,
-    trust_anchor: bool, tls_alpn_challenge: bool) bool {
+    options: *Options) bool {
+    val trust_anchor: bool = options.trust_anchor;
     if (element == nil || output == nil || element.tag != 0xa3) { ret false; }
     var outer_parent: der.Cursor = der.cursor(element.encoded);
     var outer:        der.Cursor;
@@ -1013,6 +1042,7 @@ fun parse_extensions(element: *der.Element, output: *Extensions,
     if (der.next(?outer, ?sequence) != contracts.OK ||
         sequence.tag != der.SEQUENCE || sequence.content.len == 0 ||
         !der.complete(?outer)) { ret false; }
+    output.encoded = sequence.encoded;
     var parent: der.Cursor = der.cursor(sequence.encoded);
     var body:   der.Cursor;
     der.enter(?parent, ?sequence, ?body);
@@ -1072,45 +1102,20 @@ fun parse_extensions(element: *der.Element, output: *Extensions,
         or (oid_equal(oid.content, (?OID_AUTHORITY_KEY_ID[0]), 3)) {
             if (!parse_authority_key_id(value.content, output)) { ret false; }
         }
-        or (tls_alpn_challenge && critical &&
-            oid_equal(oid.content, (?OID_ACME_IDENTIFIER[0]), 8)) {
-            var identifier: der.Element;
-            if (!one_element(value.content, der.OCTET_STRING, ?identifier) ||
-                identifier.content.len != 32) { ret false; }
-            output.acme_identifier_present = true;
-            output.acme_identifier         = identifier.content;
-        }
-        or (critical) { ret false; }
+        or (critical && !handled(options, oid.content)) { ret false; }
     }
     ret true;
 }
 
-fun tls_alpn_challenge_dns_name(value: *Extensions,
-    output: *contracts.Bytes) bool {
-    if (value == nil || output == nil || !value.subject_alt_name_present ||
-        value.subject_alt_name.data == nil ||
-        value.subject_alt_name.len == 0) { ret false; }
-    var sequence: der.Element;
-    if (der.exact(value.subject_alt_name, ?sequence) != contracts.OK ||
-        sequence.tag != der.SEQUENCE) { ret false; }
-    var parent: der.Cursor = der.cursor(value.subject_alt_name);
-    var names:  der.Cursor;
-    if (der.enter(?parent, ?sequence, ?names) != contracts.OK) { ret false; }
-    var dns_name: der.Element;
-    if (der.next(?names, ?dns_name) != contracts.OK || dns_name.tag != 0x82 ||
-        !der.complete(?names) || dns_name.content.len == 0 ||
-        dns_name.content.data[0] == '*' ||
-        !name.valid_presented_dns(dns_name.content)) { ret false; }
-    @output = dns_name.content;
-    ret true;
-}
-
-fun parse_with(input: contracts.Bytes, output: *Certificate,
-    trust_anchor: bool, tls_alpn_challenge: bool) contracts.Error {
-    if (output == nil || input.len == 0 || input.data == nil) {
+# parses input into output, which is left untouched unless parsing succeeds
+pub fun parse_with(input: contracts.Bytes, options: *Options,
+    output: *Certificate) contracts.Error {
+    if (output == nil || options == nil || input.len == 0 || input.data == nil ||
+        (options.critical_len > 0 && options.critical == nil)) {
         ret contracts.INVALID_INPUT;
     }
-    var root: der.Element;
+    val trust_anchor: bool = options.trust_anchor;
+    var root:         der.Element;
     if (!one_element(input, der.SEQUENCE, ?root)) { ret contracts.INVALID_INPUT; }
     var parent: der.Cursor = der.cursor(input);
     var body:   der.Cursor;
@@ -1203,20 +1208,14 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
         }
         or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
             saw_extensions = true;
-            if (!parse_extensions(?optional, ?extensions, trust_anchor,
-                tls_alpn_challenge)) { ret contracts.INVALID_INPUT; }
+            if (!parse_extensions(?optional, ?extensions, options)) {
+                ret contracts.INVALID_INPUT;
+            }
         }
         or { ret contracts.INVALID_INPUT; }
     }
     if (subject_empty && (!extensions.subject_alt_name_present ||
         !extensions.subject_alt_name_critical)) { ret contracts.INVALID_INPUT; }
-    if (tls_alpn_challenge) {
-        var challenge_name: contracts.Bytes;
-        if (!extensions.acme_identifier_present ||
-            !tls_alpn_challenge_dns_name(?extensions, ?challenge_name)) {
-            ret contracts.INVALID_INPUT;
-        }
-    }
     output.encoded             = input;
     output.tbs                 = tbs.encoded;
     output.version             = version;
@@ -1235,27 +1234,59 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
 }
 
 pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
-    ret parse_with(input, output, false, false);
-}
-
-# rfc 8737 requires one non-wildcard dns san equal to the validation name.
-pub fun tls_alpn_challenge_name_matches(value: *Certificate,
-    expected: contracts.Bytes) bool {
-    if (expected.data == nil || expected.len == 0 || expected.data[0] == '*' ||
-        !name.valid_reference_dns(expected)) { ret false; }
-    var presented: contracts.Bytes;
-    ret value != nil && tls_alpn_challenge_dns_name(?value.extensions, ?presented) &&
-        folded_ascii_equal(presented, expected);
-}
-
-pub fun parse_tls_alpn_challenge(input: contracts.Bytes,
-    output: *Certificate) contracts.Error {
-    ret parse_with(input, output, false, true);
+    var options: Options = Options{trust_anchor: false, critical: nil, critical_len: 0};
+    ret parse_with(input, ?options, output);
 }
 
 pub fun parse_trust_anchor(input: contracts.Bytes,
     output: *Certificate) contracts.Error {
-    ret parse_with(input, output, true, false);
+    var options: Options = Options{trust_anchor: true, critical: nil, critical_len: 0};
+    ret parse_with(input, ?options, output);
+}
+
+# the extension with object identifier content oid, if the certificate has it
+pub fun extension(value: *Certificate, oid: contracts.Bytes,
+    output: *Extension) bool {
+    if (value == nil || output == nil) { ret false; }
+    var root: der.Element;
+    if (!one_element(value.extensions.encoded, der.SEQUENCE, ?root)) { ret false; }
+    var body: der.Cursor = der.cursor(root.content);
+    for (!der.complete(?body)) {
+        var item:  der.Element;
+        var id:    der.Element;
+        var field: der.Element;
+        if (der.next(?body, ?item) != contracts.OK || item.tag != der.SEQUENCE) {
+            ret false;
+        }
+        var fields: der.Cursor = der.cursor(item.content);
+        if (der.next(?fields, ?id) != contracts.OK ||
+            der.next(?fields, ?field) != contracts.OK) { ret false; }
+        if (bytes_equal(id.content, oid)) {
+            var critical: bool = field.tag == der.BOOLEAN;
+            if (critical && der.next(?fields, ?field) != contracts.OK) { ret false; }
+            output.critical = critical;
+            output.value    = field.content;
+            ret true;
+        }
+    }
+    ret false;
+}
+
+# whether the extended key usage lists the purpose oid, given as object
+# identifier content. a certificate without the extension lists none
+pub fun has_extended_key_usage(value: *Certificate, oid: contracts.Bytes) bool {
+    if (value == nil || !value.extensions.extended_key_usage_present) { ret false; }
+    var root: der.Element;
+    if (!one_element(value.extensions.extended_key_usage, der.SEQUENCE, ?root)) {
+        ret false;
+    }
+    var body: der.Cursor = der.cursor(root.content);
+    for (!der.complete(?body)) {
+        var listed: der.Element;
+        if (der.next(?body, ?listed) != contracts.OK) { ret false; }
+        if (bytes_equal(listed.content, oid))         { ret true; }
+    }
+    ret false;
 }
 
 test x509__strict_utc_and_generalized_time_parsing {
@@ -1341,90 +1372,67 @@ test x509__distinguished_names_compare_prepared_directory_strings {
     ret 0;
 }
 
-test x509__a_tls_alpn_challenge_has_exactly_one_matching_dns_san {
-    var valid: [15]u8 = [15]u8{
-        0x30, 0x0d, 0x82, 0x0b, 'A', 'p', 'i', '.', 'E', 'x', 'a', 'm', 'p',
-        'l', 'e'
+test x509__extended_key_usage_refuses_a_repeated_purpose {
+    var listed: [22]u8 = [22]u8{
+        0x30, 0x14,
+        0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+        0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x24,
     };
+    var extensions: Extensions = empty_extensions();
+    if (!parse_extended_key_usage(contracts.Bytes{data: ?listed[0], len: 22},
+        ?extensions)) { ret 1; }
     var certificate: Certificate;
-    certificate.extensions                          = empty_extensions();
-    certificate.extensions.subject_alt_name_present = true;
-    certificate.extensions.subject_alt_name         = contracts.Bytes{
-        data: ?valid[0], len: 15
-    };
-    if (!tls_alpn_challenge_name_matches(?certificate,
-        contracts.Bytes{data: "api.example"::*u8, len: 11}) ||
-        tls_alpn_challenge_name_matches(?certificate,
-        contracts.Bytes{data: "other.example"::*u8, len: 13})) { ret 1; }
-
-    var wildcard: [13]u8 = [13]u8{
-        0x30, 0x0b, 0x82, 0x09, '*', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'
-    };
-    certificate.extensions.subject_alt_name = contracts.Bytes{
-        data: ?wildcard[0], len: 13
-    };
-    if (tls_alpn_challenge_name_matches(?certificate,
-        contracts.Bytes{data: "www.example"::*u8, len: 11}) ||
-        tls_alpn_challenge_name_matches(?certificate,
-        contracts.Bytes{data: "*.example"::*u8, len: 9})) { ret 2; }
-
-    var multiple: [30]u8 = [30]u8{
-        0x30, 0x1c, 0x82, 0x0b, 'a', 'p', 'i', '.', 'e', 'x', 'a', 'm', 'p',
-        'l', 'e', 0x82, 0x0d, 'o', 't', 'h', 'e', 'r', '.', 'e', 'x', 'a',
-        'm', 'p', 'l', 'e'
-    };
-    certificate.extensions.subject_alt_name = contracts.Bytes{
-        data: ?multiple[0], len: 30
-    };
-    if (tls_alpn_challenge_name_matches(?certificate,
-        contracts.Bytes{data: "api.example"::*u8, len: 11})) { ret 3; }
+    certificate.extensions                            = extensions;
+    certificate.extensions.extended_key_usage_present = true;
+    if (!has_extended_key_usage(?certificate,
+        contracts.Bytes{data: ?EKU_DOCUMENT_SIGNING[0], len: 8}) ||
+        has_extended_key_usage(?certificate,
+        contracts.Bytes{data: ?EKU_CLIENT_AUTH[0], len: 8})) { ret 2; }
+    listed[21] = 0x01;
+    if (parse_extended_key_usage(contracts.Bytes{data: ?listed[0], len: 22},
+        ?extensions)) { ret 3; }
     ret 0;
 }
 
+# a self-signed ed25519 certificate carrying the critical rfc 8737 acme
+# identifier extension, which this parser does not know
 #[testing]
-val TLS_ALPN_CERTIFICATE_FIXTURE: str =
+val CRITICAL_EXTENSION_FIXTURE: str =
     "MIIBejCCASygAwIBAgIUcOUWr9c1zHTCLeBvrVLI47ZLz74wBQYDK2VwMAwxCjAIBgNVBAMMAWkwHhcNMjYwODMxMjAyMzI1WhcNMjYwOTAxMjAyMzI1WjAMMQowCAYDVQQDDAFpMCowBQYDK2VwAyEAwoSBn3yOAF/HvizR83asMyXsHkJXUq2kj5jt1OpWdTSjgZ8wgZwwHQYDVR0OBBYEFKIrhX8xARkFbY8H5e2vXNJp4J6mMB8GA1UdIwQYMBaAFKIrhX8xARkFbY8H5e2vXNJp4J6mMA8GA1UdEwEB/wQFMAMBAf8wFgYDVR0RBA8wDYILQXBpLkV4YW1wbGUwMQYIKwYBBQUHAR8BAf8EIgQgAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8wBQYDK2VwA0EAPoT1BqwjpSal0uWBHFZYQkf+3m4mC4MOiNQxKWAR6omfSUlBuNSilJG9xZc5OYjefZ1LnWhSx7/us5OymlxlDA==";
 
-test x509__challenge_parsing_rejects_wildcard_and_multiple_sans_transactionally {
+#[testing]
+val OID_ACME_IDENTIFIER: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f,
+};
+
+test x509__a_caller_handles_a_critical_extension_the_parser_does_not_know {
     var encoded: [382]u8;
-    if (base64.decode(TLS_ALPN_CERTIFICATE_FIXTURE::*u8, 512,
+    if (base64.decode(CRITICAL_EXTENSION_FIXTURE::*u8, 512,
         ?encoded[0], 382) != 382) { ret 1; }
-    var valid: Certificate;
-    if (parse_tls_alpn_challenge(contracts.Bytes{data: ?encoded[0], len: 382},
-        ?valid) != contracts.OK ||
-        !tls_alpn_challenge_name_matches(?valid,
-        contracts.Bytes{data: "api.example"::*u8, len: 11})) { ret 2; }
-
-    # replace the sole name with an equal-length wildcard without resigning.
-    val wildcard: str   = "*.x.example";
-    var i:        usize = 0;
-    for (i < 11) {
-        encoded[246 + i] = wildcard[i];
-        i                = i + 1;
-    }
+    val input:    contracts.Bytes = contracts.Bytes{data: ?encoded[0], len: 382};
     var rejected: Certificate;
-    rejected.version       = 99;
-    rejected.not_after     = 123;
-    rejected.extensions    = empty_extensions();
-    rejected.extensions.ca = true;
-    if (parse_tls_alpn_challenge(contracts.Bytes{data: ?encoded[0], len: 382},
-        ?rejected) != contracts.INVALID_INPUT || rejected.version != 99 ||
-        rejected.not_after != 123 || !rejected.extensions.ca) { ret 3; }
-
-    if (base64.decode(TLS_ALPN_CERTIFICATE_FIXTURE::*u8, 512,
-        ?encoded[0], 382) != 382) { ret 4; }
-    val two_names: [13]u8 = [13]u8{
-        0x82, 0x04, 'a', '.', 'i', 'o',
-        0x82, 0x05, 'b', '.', 'd', 'e', 'v'
+    rejected.version = 99;
+    if (parse(input, ?rejected) != contracts.INVALID_INPUT ||
+        rejected.version != 99) { ret 2; }
+    var acme:    contracts.Bytes = contracts.Bytes{data: ?OID_ACME_IDENTIFIER[0], len: 8};
+    var options: Options         = Options{
+        trust_anchor: false,
+        critical:     ?acme,
+        critical_len: 1,
     };
-    i = 0;
-    for (i < 13) {
-        encoded[244 + i] = two_names[i];
-        i                = i + 1;
-    }
-    if (parse_tls_alpn_challenge(contracts.Bytes{data: ?encoded[0], len: 382},
-        ?rejected) != contracts.INVALID_INPUT || rejected.version != 99 ||
-        rejected.not_after != 123 || !rejected.extensions.ca) { ret 5; }
+    var certificate: Certificate;
+    if (parse_with(input, ?options, ?certificate) != contracts.OK) { ret 3; }
+    var found: Extension;
+    if (!extension(?certificate, acme, ?found) || !found.critical ||
+        found.value.len != 34 || found.value.data[0] != der.OCTET_STRING ||
+        found.value.data[2] != 0 || found.value.data[33] != 0x1f) { ret 4; }
+    var san_oid: [3]u8 = [3]u8{0x55, 0x1d, 0x11};
+    if (!extension(?certificate, contracts.Bytes{data: ?san_oid[0], len: 3},
+        ?found) || found.critical ||
+        found.value.data != certificate.extensions.subject_alt_name.data) { ret 5; }
+    san_oid[2] = 0x12;
+    if (extension(?certificate, contracts.Bytes{data: ?san_oid[0], len: 3},
+        ?found)) { ret 6; }
     ret 0;
 }
 
@@ -1481,7 +1489,10 @@ test x509__parse_a_strict_ed25519_server_certificate {
         !certificate.extensions.basic_constraints_present ||
         !certificate.extensions.basic_constraints_critical ||
         certificate.extensions.key_usage != KEY_USAGE_DIGITAL_SIGNATURE ||
-        certificate.extensions.purposes != PURPOSE_SERVER_AUTH ||
+        !has_extended_key_usage(?certificate,
+        contracts.Bytes{data: ?EKU_SERVER_AUTH[0], len: 8}) ||
+        has_extended_key_usage(?certificate,
+        contracts.Bytes{data: ?EKU_CLIENT_AUTH[0], len: 8}) ||
         !certificate.extensions.subject_alt_name_present ||
         !certificate.extensions.subject_key_id_present ||
         !certificate.extensions.authority_key_id_present) { ret 1; }
