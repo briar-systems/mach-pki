@@ -1,3 +1,9 @@
 # public module surface for mach-pki
 
 use std.runtime;
+
+fwd pki.cert;
+fwd pki.name;
+fwd pki.x509;
+fwd pki.load;
+fwd pki.verify;
