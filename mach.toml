@@ -20,6 +20,11 @@ isa = "x86_64"
 os  = "windows"
 abi = "win64"
 
+[target.linux-riscv64]
+isa = "riscv64"
+os  = "linux"
+abi = "lp64d"
+
 [target.darwin-x86_64]
 isa = "x86_64"
 os  = "darwin"
@@ -30,21 +35,15 @@ isa = "aarch64"
 os  = "darwin"
 abi = "aapcs64"
 
+# the library, and the only artifact `mach build .` selects
 [artifact.pki]
-kind = "bin"
-entry = "bin/pki.mach"
-out = "bin/pki{artifact.suffix}"
+kind = "static"
+default = true
+entry = "lib/pki.mach"
+out = "lib/pki"
 targets = ["*"]
-link = ["kernel32"]
+link = []
 need = []
-
-[link.kernel32]
-source = "system"
-name = "kernel32.dll"
-os = ["windows"]
-isa = ["*"]
-abi = ["*"]
-export = false
 
 [profile.debug]
 default = true
@@ -63,4 +62,8 @@ float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+version = "^9.4"
+
+[dep.crypto]
+git = "https://github.com/briar-systems/mach-crypto"
+version = "^0.26"
