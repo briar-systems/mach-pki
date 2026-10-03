@@ -1,0 +1,1466 @@
+# cms signed data (rfc 5652): build through a signer, parse and verify
+#
+# building signs through the signer contract only, so the key never reaches
+# this module. the signed attributes are content-type, message-digest, an
+# optional caller-supplied signing-time and ess signing-certificate-v2 (rfc
+# 5035). the same inputs always encode the same bytes. unsigned attributes,
+# such as an rfc 3161 time-stamp token over the signature, are attached after
+# signing.
+#
+# parsing borrows its input and is strict der. verification checks every
+# signer's signature with verify.message and its certificate path with
+# verify.chain.
+
+use crypto.contracts;
+use crypto.encoding.der;
+use crypto.hash;
+use crypto.secret;
+use pki.cert;
+use pki.key_signer;
+use contract: pki.signer;
+use path:     pki.verify;
+use pki.writer;
+use pki.x509;
+use std.chrono.time;
+use std.crypto.hash.sha512;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub def Error: u8;
+
+pub val OK: Error = 0;
+# the caller passed a malformed argument
+pub val INVALID_INPUT: Error = 1;
+# the output cannot hold the result. written reports the size needed
+pub val OUTPUT_TOO_SMALL: Error = 2;
+# the input is not strict der signed data, or its attributes are inconsistent
+pub val MALFORMED: Error = 3;
+# an algorithm this library or the signer does not support
+pub val UNSUPPORTED_ALGORITHM: Error = 4;
+# the signer failed. Result.signer says why and whether a retry may succeed
+pub val SIGNER_FAILED: Error = 5;
+pub val BAD_SIGNATURE: Error = 6;
+# the message digest does not match the content
+pub val CONTENT_MISMATCH: Error = 7;
+# no included certificate matches a signer identifier
+pub val UNKNOWN_SIGNER: Error = 8;
+# the signing-certificate-v2 attribute names another certificate
+pub val CERTIFICATE_MISMATCH: Error = 9;
+# the signer's certificate path failed. Verdict.chain says why
+pub val UNTRUSTED: Error = 10;
+# a bound below was reached
+pub val RESOURCE_LIMIT: Error = 11;
+
+# the largest signed attributes verification copies to check a signature
+pub val MAX_SIGNED_ATTRIBUTES_SIZE: usize = 8192;
+# the largest signature a signer may return
+pub val MAX_SIGNATURE_SIZE: usize = 1024;
+# the most unsigned attributes one signer may carry after attach_unsigned
+pub val MAX_UNSIGNED_ATTRIBUTES: usize = 16;
+# the longest content type object identifier, as content octets
+pub val MAX_CONTENT_TYPE_SIZE: usize = 64;
+
+pub def DigestAlgorithm: u8;
+
+pub val DIGEST_NONE: DigestAlgorithm = 0;
+pub val SHA256:      DigestAlgorithm = 1;
+pub val SHA384:      DigestAlgorithm = 2;
+pub val SHA512:      DigestAlgorithm = 3;
+
+pub val MAX_DIGEST_SIZE: usize = 64;
+
+# where the signed content is
+pub def Content: u8;
+
+# encapsulated in the signed data
+pub val ATTACHED: Content = 0;
+# held by the caller, who passes it alongside
+pub val DETACHED: Content = 1;
+# held by the caller, who passes only its digest under the signer's digest
+# algorithm
+pub val DETACHED_DIGEST: Content = 2;
+
+pub rec Result {
+    error:   Error;
+    written: usize;
+    # the signer's error when error is SIGNER_FAILED, signer.OK otherwise
+    signer: contract.Error;
+}
+
+pub rec Verdict {
+    error: Error;
+    # the path validation error when error is UNTRUSTED, verify.OK otherwise
+    chain: path.Error;
+}
+
+# what build signs
+pub rec Options {
+    # the signature algorithm, or x509.SIGNATURE_NONE for the signer's first
+    algorithm: x509.SignatureAlgorithm;
+    form:      Content;
+    # the content, for ATTACHED and DETACHED
+    content: contracts.Bytes;
+    # the content's digest under digest_algorithm(algorithm), for
+    # DETACHED_DIGEST
+    content_digest: contracts.Bytes;
+    # the content type as object identifier content, empty for id-data
+    content_type: contracts.Bytes;
+    # a signing-time attribute is added only when the caller supplies one,
+    # never from a clock
+    signing_time_present: bool;
+    signing_time:         time.Time;
+}
+
+# how verify finds the content and decides whom to trust
+pub rec VerifyOptions {
+    trust: *cert.TrustStore;
+    chain: path.Options;
+    form:  Content;
+    # the detached content, for DETACHED
+    content: contracts.Bytes;
+    # the detached content's digest under each signer's digest algorithm, for
+    # DETACHED_DIGEST
+    content_digest: contracts.Bytes;
+}
+
+# a parsed signed data, borrowing its input
+pub rec SignedData {
+    version: u8;
+    # the encapsulated content type, as object identifier content
+    content_type:    contracts.Bytes;
+    content_present: bool;
+    content:         contracts.Bytes;
+    # the certificate choices, concatenated, empty when absent
+    certificates: contracts.Bytes;
+    # the signer infos, concatenated
+    signer_infos: contracts.Bytes;
+    signer_count: usize;
+    # every field of the signed data, as encoded
+    fields: contracts.Bytes;
+}
+
+# a parsed signer info, borrowing its input
+pub rec SignerInfo {
+    version: u8;
+    # the signer identifier: an issuer and serial number magnitude, or a
+    # subject key identifier
+    issuer: contracts.Bytes;
+    serial: contracts.Bytes;
+    key_id: contracts.Bytes;
+    digest: DigestAlgorithm;
+    # the encoded [0] signed attributes, empty when absent
+    signed_attributes:   contracts.Bytes;
+    signature_algorithm: x509.SignatureAlgorithm;
+    signature:           contracts.Bytes;
+    # the encoded [1] unsigned attributes, empty when absent
+    unsigned_attributes:  contracts.Bytes;
+    message_digest:       contracts.Bytes;
+    signing_time_present: bool;
+    signing_time:         time.Time;
+    # the encoded SigningCertificateV2, empty when absent
+    signing_certificate: contracts.Bytes;
+    encoded:             contracts.Bytes;
+}
+
+# a running content digest
+pub rec Digest {
+    algorithm: DigestAlgorithm;
+    sha256:    hash.Sha256;
+    sha384:    hash.Sha384;
+    sha512:    sha512.State;
+}
+
+val ID_DATA: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01,
+};
+val ID_SIGNED_DATA: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
+};
+val ATTRIBUTE_CONTENT_TYPE: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03,
+};
+val ATTRIBUTE_MESSAGE_DIGEST: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04,
+};
+val ATTRIBUTE_SIGNING_TIME: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x05,
+};
+val ATTRIBUTE_SIGNING_CERTIFICATE_V2: [11]u8 = [11]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x02, 0x2f,
+};
+val OID_SHA512: [9]u8 = [9]u8{
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
+};
+val OID_RSA_ENCRYPTION: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+};
+
+fun built(error: Error, written: usize, signer_error: contract.Error) Result {
+    ret Result{error: error, written: written, signer: signer_error};
+}
+
+fun judged(error: Error) Verdict {
+    ret Verdict{error: error, chain: path.OK};
+}
+
+fun valid_bytes(value: contracts.Bytes) bool {
+    ret value.len == 0 || value.data != nil;
+}
+
+fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
+    if (first.len != second.len)                                    { ret false; }
+    if (first.len > 0 && (first.data == nil || second.data == nil)) { ret false; }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (first.data[i] != second.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun oid_is(value: contracts.Bytes, expected: *u8, length: usize) bool {
+    ret bytes_equal(value, contracts.Bytes{data: expected, len: length});
+}
+
+# the single element that spans input. unlike der.exact it leaves the
+# element's contents to the caller, whose own walk reads them strictly, so a
+# deep structure such as a nested time-stamp token is not refused for depth
+fun one(input: contracts.Bytes, output: *der.Element) bool {
+    var value: der.Cursor = der.cursor(input);
+    ret der.next(?value, output) == contracts.OK && der.complete(?value);
+}
+
+fun null_or_absent(body: *der.Cursor) bool {
+    if (der.complete(body)) { ret true; }
+    var parameter: der.Element;
+    ret der.next(body, ?parameter) == contracts.OK && parameter.tag == der.NULL &&
+        der.complete(body);
+}
+
+# the digest algorithm whose identifier is element, DIGEST_NONE when unknown
+fun parse_digest_algorithm(element: *der.Element) DigestAlgorithm {
+    if (element.tag != der.SEQUENCE) { ret DIGEST_NONE; }
+    var body: der.Cursor = der.cursor(element.content);
+    var oid:  der.Element;
+    if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+        !null_or_absent(?body)) { ret DIGEST_NONE; }
+    if (oid_is(oid.content, ?x509.OID_SHA256[0], 9)) { ret SHA256; }
+    if (oid_is(oid.content, ?x509.OID_SHA384[0], 9)) { ret SHA384; }
+    if (oid_is(oid.content, ?OID_SHA512[0], 9))      { ret SHA512; }
+    ret DIGEST_NONE;
+}
+
+fun digest_oid(algorithm: DigestAlgorithm) *u8 {
+    if (algorithm == SHA256) { ret ?x509.OID_SHA256[0]; }
+    if (algorithm == SHA384) { ret ?x509.OID_SHA384[0]; }
+    ret ?OID_SHA512[0];
+}
+
+# the digest algorithm a signature algorithm pairs with: its own hash, and
+# sha-512 for ed25519 (rfc 8419)
+pub fun digest_algorithm(algorithm: x509.SignatureAlgorithm) DigestAlgorithm {
+    if (algorithm == x509.ED25519) { ret SHA512; }
+    if (algorithm == x509.ECDSA_P256_SHA256 || algorithm == x509.RSA_PSS_SHA256 ||
+        algorithm == x509.RSA_PKCS1_SHA256) { ret SHA256; }
+    if (algorithm == x509.ECDSA_P384_SHA384 || algorithm == x509.RSA_PSS_SHA384 ||
+        algorithm == x509.RSA_PKCS1_SHA384) { ret SHA384; }
+    ret DIGEST_NONE;
+}
+
+# the digest's size in bytes, 0 when unknown
+pub fun digest_size(algorithm: DigestAlgorithm) usize {
+    if (algorithm == SHA256) { ret 32; }
+    if (algorithm == SHA384) { ret 48; }
+    if (algorithm == SHA512) { ret 64; }
+    ret 0;
+}
+
+# start a digest, for content that arrives in pieces such as a pdf byte range
+pub fun digest_init(value: *Digest, algorithm: DigestAlgorithm) contracts.Error {
+    if (value == nil || digest_size(algorithm) == 0) { ret contracts.INVALID_INPUT; }
+    value.algorithm = algorithm;
+    if (algorithm == SHA256) {
+        value.sha256 = hash.empty_sha256();
+        ret hash.init_sha256(?value.sha256);
+    }
+    if (algorithm == SHA384) {
+        value.sha384 = hash.empty_sha384();
+        ret hash.init_sha384(?value.sha384);
+    }
+    value.sha512 = sha512.init();
+    ret contracts.OK;
+}
+
+pub fun digest_update(value: *Digest, input: contracts.Bytes) contracts.Error {
+    if (value == nil || !valid_bytes(input)) { ret contracts.INVALID_INPUT; }
+    if (value.algorithm == SHA256)           { ret hash.update_sha256(?value.sha256, input); }
+    if (value.algorithm == SHA384)           { ret hash.update_sha384(?value.sha384, input); }
+    if (value.algorithm != SHA512)           { ret contracts.INVALID_STATE; }
+    if (input.len > 0)                       { sha512.update(?value.sha512, input.data, input.len); }
+    ret contracts.OK;
+}
+
+# finish the digest into output and leave the value spent
+pub fun digest_final(value: *Digest, output: contracts.Buffer) contracts.Operation {
+    if (value == nil) {
+        ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
+    }
+    val algorithm: DigestAlgorithm = value.algorithm;
+    if (algorithm == DIGEST_NONE) {
+        ret contracts.Operation{error: contracts.INVALID_STATE, written: 0};
+    }
+    if (output.capacity < digest_size(algorithm)) {
+        ret contracts.Operation{error: contracts.OUTPUT_TOO_SMALL, written: 0};
+    }
+    if (output.data == nil) {
+        ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
+    }
+    value.algorithm = DIGEST_NONE;
+    if (algorithm == SHA256) { ret hash.final_sha256(?value.sha256, output); }
+    if (algorithm == SHA384) { ret hash.final_sha384(?value.sha384, output); }
+    sha512.final(?value.sha512, output.data);
+    ret contracts.Operation{error: contracts.OK, written: 64};
+}
+
+fun digest_of(algorithm: DigestAlgorithm, input: contracts.Bytes, output: *u8) bool {
+    var value: Digest;
+    if (digest_init(?value, algorithm) != contracts.OK ||
+        digest_update(?value, input) != contracts.OK) { ret false; }
+    ret digest_final(?value, contracts.Buffer{data: output, capacity: MAX_DIGEST_SIZE}).error ==
+        contracts.OK;
+}
+
+fun write_digest_algorithm(value: *writer.Writer, algorithm: DigestAlgorithm) {
+    val mark: usize = writer.open(value);
+    writer.element(value, der.OBJECT_ID, contracts.Bytes{data: digest_oid(algorithm), len: 9});
+    writer.close(value, mark, der.SEQUENCE);
+}
+
+fun write_attribute(value: *writer.Writer, oid: *u8, oid_len: usize,
+    encoded: contracts.Bytes) {
+    val mark: usize = writer.open(value);
+    writer.element(value, der.OBJECT_ID, contracts.Bytes{data: oid, len: oid_len});
+    val values: usize = writer.open(value);
+    writer.raw(value, encoded);
+    writer.close(value, values, 0x31);
+    writer.close(value, mark, der.SEQUENCE);
+}
+
+# the signed attributes as their der set, sorted
+fun signed_attributes(options: *Options, content_type: contracts.Bytes,
+    digest: contracts.Bytes, leaf: contracts.Bytes,
+    output: contracts.Buffer) contracts.Operation {
+    var scratch:  [512]u8;
+    var parts:    writer.Writer = writer.into(contracts.Buffer{data: ?scratch[0], capacity: 512});
+    var elements: [4]contracts.Bytes;
+    var count:    usize         = 0;
+    var value:    [96]u8;
+    var start:    usize         = 0;
+    var made:     contracts.Operation;
+
+    made = der.write(der.OBJECT_ID, content_type,
+        contracts.Buffer{data: ?value[0], capacity: 96});
+    if (made.error != contracts.OK) { ret made; }
+    start = parts.len;
+    write_attribute(?parts, ?ATTRIBUTE_CONTENT_TYPE[0], 9,
+        contracts.Bytes{data: ?value[0], len: made.written});
+    elements[count] = contracts.Bytes{data: ?scratch[start], len: parts.len - start};
+    count           = count + 1;
+
+    if (options.signing_time_present) {
+        made = x509.write_time(options.signing_time,
+            contracts.Buffer{data: ?value[0], capacity: 96});
+        if (made.error != contracts.OK) { ret made; }
+        start = parts.len;
+        write_attribute(?parts, ?ATTRIBUTE_SIGNING_TIME[0], 9,
+            contracts.Bytes{data: ?value[0], len: made.written});
+        elements[count] = contracts.Bytes{data: ?scratch[start], len: parts.len - start};
+        count           = count + 1;
+    }
+
+    made = der.write(der.OCTET_STRING, digest,
+        contracts.Buffer{data: ?value[0], capacity: 96});
+    if (made.error != contracts.OK) { ret made; }
+    start = parts.len;
+    write_attribute(?parts, ?ATTRIBUTE_MESSAGE_DIGEST[0], 9,
+        contracts.Bytes{data: ?value[0], len: made.written});
+    elements[count] = contracts.Bytes{data: ?scratch[start], len: parts.len - start};
+    count           = count + 1;
+
+    # ess signing-certificate-v2 names the leaf by its sha-256 hash, the
+    # default algorithm and so omitted. issuerSerial is left out, as etsi en
+    # 319 122-1 asks of cades baseline signatures
+    var leaf_hash: [MAX_DIGEST_SIZE]u8;
+    if (!digest_of(SHA256, leaf, ?leaf_hash[0])) {
+        ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
+    }
+    var reference: writer.Writer = writer.into(contracts.Buffer{data: ?value[0], capacity: 96});
+    val signing:   usize         = writer.open(?reference);
+    val certs:     usize         = writer.open(?reference);
+    val id:        usize         = writer.open(?reference);
+    writer.element(?reference, der.OCTET_STRING, contracts.Bytes{data: ?leaf_hash[0], len: 32});
+    writer.close(?reference, id, der.SEQUENCE);
+    writer.close(?reference, certs, der.SEQUENCE);
+    writer.close(?reference, signing, der.SEQUENCE);
+    made = writer.result(?reference);
+    if (made.error != contracts.OK) { ret made; }
+    start = parts.len;
+    write_attribute(?parts, ?ATTRIBUTE_SIGNING_CERTIFICATE_V2[0], 11,
+        contracts.Bytes{data: ?value[0], len: made.written});
+    elements[count] = contracts.Bytes{data: ?scratch[start], len: parts.len - start};
+    count           = count + 1;
+
+    made = writer.result(?parts);
+    if (made.error != contracts.OK) { ret made; }
+    writer.sort(?elements[0], count);
+    var set:  writer.Writer = writer.into(output);
+    val mark: usize         = writer.open(?set);
+    var i:    usize         = 0;
+    for (i < count) {
+        writer.raw(?set, elements[i]);
+        i = i + 1;
+    }
+    writer.close(?set, mark, 0x31);
+    ret writer.result(?set);
+}
+
+# everything build encodes around the signature
+rec Parts {
+    version:           u8;
+    digest:            DigestAlgorithm;
+    content_type:      contracts.Bytes;
+    attached:          bool;
+    content:           contracts.Bytes;
+    certificates:      *contracts.Bytes;
+    certificate_count: usize;
+    issuer:            contracts.Bytes;
+    serial:            contracts.Bytes;
+    # the signed attributes' set content
+    attributes:   contracts.Bytes;
+    algorithm_id: contracts.Bytes;
+    signature:    contracts.Bytes;
+}
+
+fun write_serial(value: *writer.Writer, magnitude: contracts.Bytes) {
+    var integer: [21]u8;
+    var offset:  usize = 0;
+    if (magnitude.len == 0 || magnitude.len > 20) {
+        value.error = contracts.INVALID_INPUT;
+        ret;
+    }
+    if ((magnitude.data[0] & 0x80) != 0) { offset = 1; }
+    memory.copy[u8](?integer[offset], magnitude.data, magnitude.len);
+    writer.element(value, der.INTEGER,
+        contracts.Bytes{data: ?integer[0], len: offset + magnitude.len});
+}
+
+fun write_signed_data(value: *writer.Writer, parts: *Parts) {
+    val info: usize = writer.open(value);
+    writer.element(value, der.OBJECT_ID, contracts.Bytes{data: ?ID_SIGNED_DATA[0], len: 9});
+    val explicit: usize = writer.open(value);
+    val signed:   usize = writer.open(value);
+    var version:  u8    = parts.version;
+    writer.element(value, der.INTEGER, contracts.Bytes{data: ?version, len: 1});
+    val digests: usize = writer.open(value);
+    write_digest_algorithm(value, parts.digest);
+    writer.close(value, digests, 0x31);
+    val encapsulated: usize = writer.open(value);
+    writer.element(value, der.OBJECT_ID, parts.content_type);
+    if (parts.attached) {
+        val content: usize = writer.open(value);
+        writer.element(value, der.OCTET_STRING, parts.content);
+        writer.close(value, content, 0xa0);
+    }
+    writer.close(value, encapsulated, der.SEQUENCE);
+    val certificates: usize = writer.open(value);
+    var i:            usize = 0;
+    for (i < parts.certificate_count) {
+        writer.raw(value, parts.certificates[i]);
+        i = i + 1;
+    }
+    writer.close(value, certificates, 0xa0);
+    val infos:          usize = writer.open(value);
+    val signer:         usize = writer.open(value);
+    var signer_version: u8    = 1;
+    writer.element(value, der.INTEGER, contracts.Bytes{data: ?signer_version, len: 1});
+    val sid: usize = writer.open(value);
+    writer.raw(value, parts.issuer);
+    write_serial(value, parts.serial);
+    writer.close(value, sid, der.SEQUENCE);
+    write_digest_algorithm(value, parts.digest);
+    val attributes: usize = writer.open(value);
+    writer.raw(value, parts.attributes);
+    writer.close(value, attributes, 0xa0);
+    writer.raw(value, parts.algorithm_id);
+    writer.element(value, der.OCTET_STRING, parts.signature);
+    writer.close(value, signer, der.SEQUENCE);
+    writer.close(value, infos, 0x31);
+    writer.close(value, signed, der.SEQUENCE);
+    writer.close(value, explicit, 0xa0);
+    writer.close(value, info, der.SEQUENCE);
+}
+
+# build a signed data over the options' content, signed by value
+#
+# the signer's whole chain is included and the leaf is identified by issuer
+# and serial number. the output's size is measured before the signer is
+# asked, so a short output reports OUTPUT_TOO_SMALL with the size needed and
+# never spends a signature.
+pub fun build(value: *contract.Signer, options: *Options,
+    output: contracts.Buffer) Result {
+    if (value == nil || options == nil || options.form > DETACHED_DIGEST ||
+        !valid_bytes(options.content) || !valid_bytes(options.content_digest) ||
+        !valid_bytes(options.content_type) ||
+        options.content_type.len > MAX_CONTENT_TYPE_SIZE ||
+        (output.capacity > 0 && output.data == nil)) {
+        ret built(INVALID_INPUT, 0, contract.OK);
+    }
+    var content_type: contracts.Bytes = contracts.Bytes{data: ?ID_DATA[0], len: 9};
+    var version:      u8              = 1;
+    if (options.content_type.len > 0 && !oid_is(options.content_type, ?ID_DATA[0], 9)) {
+        content_type = options.content_type;
+        version      = 3;
+    }
+    var algorithm: x509.SignatureAlgorithm = options.algorithm;
+    if (algorithm == x509.SIGNATURE_NONE) { algorithm = contract.algorithm(value, 0); }
+    val digest: DigestAlgorithm = digest_algorithm(algorithm);
+    if (digest == DIGEST_NONE || !contract.supports(value, algorithm)) {
+        ret built(UNSUPPORTED_ALGORITHM, 0, contract.OK);
+    }
+    val signature_max: usize = contract.signature_size(value, algorithm);
+    if (signature_max == 0 || signature_max > MAX_SIGNATURE_SIZE) {
+        ret built(UNSUPPORTED_ALGORITHM, 0, contract.OK);
+    }
+    val chain: cert.Chain = contract.chain(value);
+    if (chain.certificates == nil || chain.len == 0 || chain.len > path.MAX_CHAIN_DEPTH) {
+        ret built(INVALID_INPUT, 0, contract.OK);
+    }
+    var certificates: [path.MAX_CHAIN_DEPTH]contracts.Bytes;
+    var i:            usize = 0;
+    for (i < chain.len) {
+        certificates[i] = contracts.Bytes{data: chain.certificates[i].der,
+            len: chain.certificates[i].der_len};
+        if (certificates[i].data == nil || certificates[i].len == 0) {
+            ret built(INVALID_INPUT, 0, contract.OK);
+        }
+        i = i + 1;
+    }
+    var leaf: x509.Certificate;
+    if (x509.parse(certificates[0], ?leaf) != contracts.OK) {
+        ret built(INVALID_INPUT, 0, contract.OK);
+    }
+
+    var content_digest: [MAX_DIGEST_SIZE]u8;
+    val digest_len:     usize = digest_size(digest);
+    if (options.form == DETACHED_DIGEST) {
+        if (options.content_digest.len != digest_len) {
+            ret built(INVALID_INPUT, 0, contract.OK);
+        }
+        memory.copy[u8](?content_digest[0], options.content_digest.data, digest_len);
+    }
+    or (!digest_of(digest, options.content, ?content_digest[0])) {
+        ret built(INVALID_INPUT, 0, contract.OK);
+    }
+
+    var attributes: [512]u8;
+    val made:       contracts.Operation = signed_attributes(options, content_type,
+        contracts.Bytes{data: ?content_digest[0], len: digest_len}, certificates[0],
+        contracts.Buffer{data: ?attributes[0], capacity: 512});
+    var attribute_set: der.Element;
+    if (made.error != contracts.OK ||
+        !one(contracts.Bytes{data: ?attributes[0], len: made.written}, ?attribute_set)) {
+        ret built(INVALID_INPUT, 0, contract.OK);
+    }
+    var algorithm_id: [96]u8;
+    val identified:   contracts.Operation = x509.write_signature_algorithm(algorithm,
+        contracts.Buffer{data: ?algorithm_id[0], capacity: 96});
+    if (identified.error != contracts.OK) { ret built(UNSUPPORTED_ALGORITHM, 0, contract.OK); }
+
+    writer.sort(?certificates[0], chain.len);
+    var parts: Parts = Parts{
+        version:           version,
+        digest:            digest,
+        content_type:      content_type,
+        attached:          options.form == ATTACHED,
+        content:           options.content,
+        certificates:      ?certificates[0],
+        certificate_count: chain.len,
+        issuer:            leaf.issuer,
+        serial:            leaf.serial,
+        attributes:        attribute_set.content,
+        algorithm_id:      contracts.Bytes{data: ?algorithm_id[0], len: identified.written},
+        signature:         contracts.Bytes{data: nil, len: signature_max},
+    };
+    var counter: writer.Writer = writer.measuring();
+    write_signed_data(?counter, ?parts);
+    if (counter.error != contracts.OK) { ret built(INVALID_INPUT, 0, contract.OK); }
+    if (counter.len > output.capacity) { ret built(OUTPUT_TOO_SMALL, counter.len, contract.OK); }
+
+    var signature: [MAX_SIGNATURE_SIZE]u8;
+    val signed:    contract.Result = contract.sign(value, algorithm,
+        contracts.Bytes{data: ?attributes[0], len: made.written},
+        contracts.Buffer{data: ?signature[0], capacity: MAX_SIGNATURE_SIZE});
+    if (signed.error != contract.OK) { ret built(SIGNER_FAILED, 0, signed.error); }
+    parts.signature = contracts.Bytes{data: ?signature[0], len: signed.written};
+    var encoded: writer.Writer = writer.into(output);
+    write_signed_data(?encoded, ?parts);
+    if (encoded.error != contracts.OK) { ret built(INVALID_INPUT, 0, contract.OK); }
+    ret built(OK, encoded.len, contract.OK);
+}
+
+# parse a content info holding signed data
+pub fun parse(input: contracts.Bytes, output: *SignedData) Error {
+    if (output == nil || !valid_bytes(input)) { ret INVALID_INPUT; }
+    var info: der.Element;
+    if (!one(input, ?info) || info.tag != der.SEQUENCE) { ret MALFORMED; }
+    var outer:    der.Cursor = der.cursor(info.content);
+    var oid:      der.Element;
+    var explicit: der.Element;
+    var signed:   der.Element;
+    if (der.next(?outer, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+        !oid_is(oid.content, ?ID_SIGNED_DATA[0], 9) ||
+        der.next(?outer, ?explicit) != contracts.OK || explicit.tag != 0xa0 ||
+        !der.complete(?outer) || !one(explicit.content, ?signed) ||
+        signed.tag != der.SEQUENCE) { ret MALFORMED; }
+
+    var parsed: SignedData;
+    parsed.fields = signed.content;
+    var fields:       der.Cursor = der.cursor(signed.content);
+    var version:      der.Element;
+    var digests:      der.Element;
+    var encapsulated: der.Element;
+    if (der.next(?fields, ?version) != contracts.OK || version.tag != der.INTEGER ||
+        version.content.len != 1 ||
+        (version.content.data[0] != 1 && version.content.data[0] != 3 &&
+        version.content.data[0] != 4 && version.content.data[0] != 5) ||
+        der.next(?fields, ?digests) != contracts.OK || digests.tag != 0x31 ||
+        der.next(?fields, ?encapsulated) != contracts.OK ||
+        encapsulated.tag != der.SEQUENCE) { ret MALFORMED; }
+    parsed.version = version.content.data[0];
+    var digest_body: der.Cursor = der.cursor(digests.content);
+    for (!der.complete(?digest_body)) {
+        var listed: der.Element;
+        if (der.next(?digest_body, ?listed) != contracts.OK || listed.tag != der.SEQUENCE) {
+            ret MALFORMED;
+        }
+    }
+
+    var encapsulated_body: der.Cursor = der.cursor(encapsulated.content);
+    var content_type:      der.Element;
+    if (der.next(?encapsulated_body, ?content_type) != contracts.OK ||
+        content_type.tag != der.OBJECT_ID) { ret MALFORMED; }
+    parsed.content_type = content_type.content;
+    if (!der.complete(?encapsulated_body)) {
+        var wrapped: der.Element;
+        var content: der.Element;
+        if (der.next(?encapsulated_body, ?wrapped) != contracts.OK || wrapped.tag != 0xa0 ||
+            !der.complete(?encapsulated_body) || !one(wrapped.content, ?content) ||
+            content.tag != der.OCTET_STRING) { ret MALFORMED; }
+        parsed.content_present = true;
+        parsed.content         = content.content;
+    }
+
+    var current: der.Element;
+    if (der.next(?fields, ?current) != contracts.OK) { ret MALFORMED; }
+    if (current.tag == 0xa0) {
+        parsed.certificates = current.content;
+        var choices: der.Cursor = der.cursor(current.content);
+        for (!der.complete(?choices)) {
+            var choice: der.Element;
+            if (der.next(?choices, ?choice) != contracts.OK ||
+                (choice.tag != der.SEQUENCE && (choice.tag < 0xa0 || choice.tag > 0xa3))) {
+                ret MALFORMED;
+            }
+        }
+        if (der.next(?fields, ?current) != contracts.OK) { ret MALFORMED; }
+    }
+    if (current.tag == 0xa1 && der.next(?fields, ?current) != contracts.OK) {
+        ret MALFORMED;
+    }
+    if (current.tag != 0x31 || !der.complete(?fields)) { ret MALFORMED; }
+    parsed.signer_infos = current.content;
+    var signers: der.Cursor = der.cursor(current.content);
+    for (!der.complete(?signers)) {
+        var signer: der.Element;
+        if (der.next(?signers, ?signer) != contracts.OK || signer.tag != der.SEQUENCE) {
+            ret MALFORMED;
+        }
+        parsed.signer_count = parsed.signer_count + 1;
+    }
+    if (parsed.signer_count == 0) { ret MALFORMED; }
+    @output = parsed;
+    ret OK;
+}
+
+# an attribute's type and its set of values
+fun attribute_parts(element: *der.Element, oid: *der.Element, values: *der.Element) bool {
+    if (element.tag != der.SEQUENCE) { ret false; }
+    var body: der.Cursor = der.cursor(element.content);
+    ret der.next(?body, oid) == contracts.OK && oid.tag == der.OBJECT_ID &&
+        der.next(?body, values) == contracts.OK && values.tag == 0x31 && der.complete(?body);
+}
+
+fun resolve_signature_algorithm(element: *der.Element, digest: DigestAlgorithm,
+    output: *x509.SignatureAlgorithm) bool {
+    if (x509.signature_algorithm(element.encoded, output)) { ret true; }
+    # rfc 5754 3.2 also lets an rsa pkcs #1 v1.5 signer name rsaEncryption,
+    # with the hash taken from the digest algorithm
+    if (element.tag != der.SEQUENCE) { ret false; }
+    var body: der.Cursor = der.cursor(element.content);
+    var oid:  der.Element;
+    if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+        !oid_is(oid.content, ?OID_RSA_ENCRYPTION[0], 9) || !null_or_absent(?body)) {
+        ret false;
+    }
+    if (digest == SHA256) {
+        @output = x509.RSA_PKCS1_SHA256;
+        ret true;
+    }
+    if (digest == SHA384) {
+        @output = x509.RSA_PKCS1_SHA384;
+        ret true;
+    }
+    ret false;
+}
+
+fun parse_signed_attributes(value: *SignedData, parsed: *SignerInfo) Error {
+    var attributes: der.Element;
+    if (!one(parsed.signed_attributes, ?attributes)) { ret MALFORMED; }
+    var body:                der.Cursor = der.cursor(attributes.content);
+    var saw_content_type:    bool       = false;
+    var saw_message_digest:  bool       = false;
+    var saw_signing_time:    bool       = false;
+    var saw_signing_cert_v2: bool       = false;
+    for (!der.complete(?body)) {
+        var attribute: der.Element;
+        var oid:       der.Element;
+        var values:    der.Element;
+        if (der.next(?body, ?attribute) != contracts.OK ||
+            !attribute_parts(?attribute, ?oid, ?values)) { ret MALFORMED; }
+        var single: der.Element;
+        if (oid_is(oid.content, ?ATTRIBUTE_CONTENT_TYPE[0], 9)) {
+            if (saw_content_type || !one(values.content, ?single) ||
+                single.tag != der.OBJECT_ID ||
+                !bytes_equal(single.content, value.content_type)) { ret MALFORMED; }
+            saw_content_type = true;
+        }
+        or (oid_is(oid.content, ?ATTRIBUTE_MESSAGE_DIGEST[0], 9)) {
+            if (saw_message_digest || !one(values.content, ?single) ||
+                single.tag != der.OCTET_STRING ||
+                single.content.len != digest_size(parsed.digest)) { ret MALFORMED; }
+            parsed.message_digest = single.content;
+            saw_message_digest    = true;
+        }
+        or (oid_is(oid.content, ?ATTRIBUTE_SIGNING_TIME[0], 9)) {
+            var seconds: i64 = 0;
+            if (saw_signing_time || !one(values.content, ?single) ||
+                !x509.parse_time_value(single.encoded, ?seconds)) { ret MALFORMED; }
+            parsed.signing_time_present = true;
+            parsed.signing_time         = time.unix(seconds, 0);
+            saw_signing_time            = true;
+        }
+        or (oid_is(oid.content, ?ATTRIBUTE_SIGNING_CERTIFICATE_V2[0], 11)) {
+            var checked: der.Element;
+            if (saw_signing_cert_v2 || !one(values.content, ?single) ||
+                single.tag != der.SEQUENCE ||
+                der.exact(single.encoded, ?checked) != contracts.OK) { ret MALFORMED; }
+            parsed.signing_certificate = single.encoded;
+            saw_signing_cert_v2        = true;
+        }
+    }
+    if (!saw_content_type || !saw_message_digest) { ret MALFORMED; }
+    # rfc 8419 3.1: ed25519 signers digest the content with sha-512
+    if (parsed.signature_algorithm == x509.ED25519 && parsed.digest != SHA512) {
+        ret MALFORMED;
+    }
+    ret OK;
+}
+
+# parse the index-th signer info of a parsed signed data
+pub fun signer_info(value: *SignedData, index: usize, output: *SignerInfo) Error {
+    if (value == nil || output == nil || index >= value.signer_count) { ret INVALID_INPUT; }
+    var signers: der.Cursor = der.cursor(value.signer_infos);
+    var element: der.Element;
+    var i:       usize      = 0;
+    for (i <= index) {
+        if (der.next(?signers, ?element) != contracts.OK) { ret MALFORMED; }
+        i = i + 1;
+    }
+    var parsed: SignerInfo;
+    parsed.encoded = element.encoded;
+    var body:    der.Cursor = der.cursor(element.content);
+    var version: der.Element;
+    var sid:     der.Element;
+    if (der.next(?body, ?version) != contracts.OK || version.tag != der.INTEGER ||
+        version.content.len != 1 || der.next(?body, ?sid) != contracts.OK) {
+        ret MALFORMED;
+    }
+    parsed.version = version.content.data[0];
+    if (sid.tag == der.SEQUENCE && parsed.version == 1) {
+        var sid_body: der.Cursor = der.cursor(sid.content);
+        var issuer:   der.Element;
+        var serial:   der.Element;
+        var checked:  der.Element;
+        if (der.next(?sid_body, ?issuer) != contracts.OK || issuer.tag != der.SEQUENCE ||
+            der.exact(issuer.encoded, ?checked) != contracts.OK ||
+            der.next(?sid_body, ?serial) != contracts.OK || !der.complete(?sid_body) ||
+            der.positive_integer(?serial, ?parsed.serial) != contracts.OK) {
+            ret MALFORMED;
+        }
+        parsed.issuer = issuer.encoded;
+    }
+    or (sid.tag == 0x80 && parsed.version == 3 && sid.content.len > 0) {
+        parsed.key_id = sid.content;
+    }
+    or { ret MALFORMED; }
+
+    var current: der.Element;
+    if (der.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
+    parsed.digest = parse_digest_algorithm(?current);
+    if (parsed.digest == DIGEST_NONE)              { ret UNSUPPORTED_ALGORITHM; }
+    if (der.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
+    if (current.tag == 0xa0) {
+        parsed.signed_attributes = current.encoded;
+        if (der.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
+    }
+    if (current.tag != der.SEQUENCE) { ret MALFORMED; }
+    if (!resolve_signature_algorithm(?current, parsed.digest, ?parsed.signature_algorithm)) {
+        ret UNSUPPORTED_ALGORITHM;
+    }
+    var signature: der.Element;
+    if (der.next(?body, ?signature) != contracts.OK || signature.tag != der.OCTET_STRING ||
+        signature.content.len == 0) { ret MALFORMED; }
+    parsed.signature = signature.content;
+    if (!der.complete(?body)) {
+        if (der.next(?body, ?current) != contracts.OK || current.tag != 0xa1 ||
+            !der.complete(?body)) { ret MALFORMED; }
+        var unsigned: der.Cursor = der.cursor(current.content);
+        if (der.complete(?unsigned)) { ret MALFORMED; }
+        for (!der.complete(?unsigned)) {
+            var attribute: der.Element;
+            var oid:       der.Element;
+            var values:    der.Element;
+            if (der.next(?unsigned, ?attribute) != contracts.OK ||
+                !attribute_parts(?attribute, ?oid, ?values)) { ret MALFORMED; }
+        }
+        parsed.unsigned_attributes = current.encoded;
+    }
+    if (parsed.signed_attributes.len > 0) {
+        val attributes: Error = parse_signed_attributes(value, ?parsed);
+        if (attributes != OK) { ret attributes; }
+    }
+    or (!oid_is(value.content_type, ?ID_DATA[0], 9)) {
+        # rfc 5652 5.3: other content types require signed attributes
+        ret MALFORMED;
+    }
+    @output = parsed;
+    ret OK;
+}
+
+fun signer_matches(info: *SignerInfo, candidate: *x509.Certificate) bool {
+    if (info.key_id.len > 0) {
+        ret candidate.extensions.subject_key_id_present &&
+            bytes_equal(info.key_id, candidate.extensions.subject_key_id);
+    }
+    ret x509.name_equal(info.issuer, candidate.issuer) &&
+        bytes_equal(info.serial, candidate.serial);
+}
+
+# collect the included certificates with the signer's first
+fun find_signer(value: *SignedData, info: *SignerInfo, certificates: *cert.Certificate,
+    count: *usize, leaf: *x509.Certificate) Error {
+    var choices: der.Cursor = der.cursor(value.certificates);
+    var found:   bool       = false;
+    var total:   usize      = 0;
+    for (!der.complete(?choices)) {
+        var choice: der.Element;
+        if (der.next(?choices, ?choice) != contracts.OK) { ret MALFORMED; }
+        if (choice.tag != der.SEQUENCE)                  { cnt; }
+        if (total == path.MAX_CHAIN_DEPTH)               { ret RESOURCE_LIMIT; }
+        certificates[total] = cert.Certificate{der: choice.encoded.data,
+            der_len: choice.encoded.len};
+        var candidate: x509.Certificate;
+        if (!found && x509.parse(choice.encoded, ?candidate) == contracts.OK &&
+            signer_matches(info, ?candidate)) {
+            found = true;
+            @leaf = candidate;
+            val first: cert.Certificate = certificates[0];
+            certificates[0]     = certificates[total];
+            certificates[total] = first;
+        }
+        total = total + 1;
+    }
+    if (!found) { ret UNKNOWN_SIGNER; }
+    @count = total;
+    ret OK;
+}
+
+fun check_signing_certificate(info: *SignerInfo, leaf: *x509.Certificate) Error {
+    var signing: der.Element;
+    var certs:   der.Element;
+    var id:      der.Element;
+    if (!one(info.signing_certificate, ?signing)) { ret MALFORMED; }
+    var signing_body: der.Cursor = der.cursor(signing.content);
+    if (der.next(?signing_body, ?certs) != contracts.OK || certs.tag != der.SEQUENCE) {
+        ret MALFORMED;
+    }
+    var certs_body: der.Cursor = der.cursor(certs.content);
+    if (der.next(?certs_body, ?id) != contracts.OK || id.tag != der.SEQUENCE) {
+        ret MALFORMED;
+    }
+    # rfc 5035 5.4: the first identifier is the signer's certificate
+    var id_body:   der.Cursor      = der.cursor(id.content);
+    var current:   der.Element;
+    var algorithm: DigestAlgorithm = SHA256;
+    if (der.next(?id_body, ?current) != contracts.OK) { ret MALFORMED; }
+    if (current.tag == der.SEQUENCE) {
+        algorithm = parse_digest_algorithm(?current);
+        if (algorithm == DIGEST_NONE)                     { ret UNSUPPORTED_ALGORITHM; }
+        if (der.next(?id_body, ?current) != contracts.OK) { ret MALFORMED; }
+    }
+    if (current.tag != der.OCTET_STRING || current.content.len != digest_size(algorithm)) {
+        ret MALFORMED;
+    }
+    var expected: [MAX_DIGEST_SIZE]u8;
+    if (!digest_of(algorithm, leaf.encoded, ?expected[0])) { ret MALFORMED; }
+    if (!bytes_equal(current.content,
+        contracts.Bytes{data: ?expected[0], len: current.content.len})) {
+        ret CERTIFICATE_MISMATCH;
+    }
+    if (der.complete(?id_body)) { ret OK; }
+    var issuer_serial: der.Element;
+    var names:         der.Element;
+    var serial:        der.Element;
+    var magnitude:     contracts.Bytes;
+    if (der.next(?id_body, ?issuer_serial) != contracts.OK ||
+        issuer_serial.tag != der.SEQUENCE || !der.complete(?id_body)) { ret MALFORMED; }
+    var serial_body: der.Cursor = der.cursor(issuer_serial.content);
+    if (der.next(?serial_body, ?names) != contracts.OK || names.tag != der.SEQUENCE ||
+        der.next(?serial_body, ?serial) != contracts.OK || !der.complete(?serial_body) ||
+        der.positive_integer(?serial, ?magnitude) != contracts.OK) { ret MALFORMED; }
+    if (!bytes_equal(magnitude, leaf.serial)) { ret CERTIFICATE_MISMATCH; }
+    var names_body: der.Cursor = der.cursor(names.content);
+    for (!der.complete(?names_body)) {
+        var name: der.Element;
+        if (der.next(?names_body, ?name) != contracts.OK)                   { ret MALFORMED; }
+        if (name.tag == 0xa4 && x509.name_equal(name.content, leaf.issuer)) { ret OK; }
+    }
+    ret CERTIFICATE_MISMATCH;
+}
+
+fun verify_signer(value: *SignedData, index: usize, options: *VerifyOptions,
+    output: *SignerInfo) Verdict {
+    var info:   SignerInfo;
+    val parsed: Error = signer_info(value, index, ?info);
+    if (parsed != OK) { ret judged(parsed); }
+
+    var content:      contracts.Bytes = value.content;
+    var have_content: bool            = value.content_present;
+    if (value.content_present) {
+        if (options.form != ATTACHED) { ret judged(INVALID_INPUT); }
+    }
+    or (options.form == DETACHED) {
+        content      = options.content;
+        have_content = true;
+    }
+    or (options.form != DETACHED_DIGEST) { ret judged(INVALID_INPUT); }
+
+    var certificates: [path.MAX_CHAIN_DEPTH]cert.Certificate;
+    var count:        usize = 0;
+    var leaf:         x509.Certificate;
+    val found:        Error = find_signer(value, ?info, ?certificates[0], ?count, ?leaf);
+    if (found != OK) { ret judged(found); }
+
+    var message: [MAX_SIGNED_ATTRIBUTES_SIZE]u8;
+    var signed:  contracts.Bytes = content;
+    if (info.signed_attributes.len > 0) {
+        var computed: [MAX_DIGEST_SIZE]u8;
+        var digest:   contracts.Bytes = options.content_digest;
+        if (have_content) {
+            if (!digest_of(info.digest, content, ?computed[0])) { ret judged(INVALID_INPUT); }
+            digest = contracts.Bytes{data: ?computed[0], len: digest_size(info.digest)};
+        }
+        or (digest.len != digest_size(info.digest) || digest.data == nil) {
+            ret judged(INVALID_INPUT);
+        }
+        if (!bytes_equal(digest, info.message_digest)) { ret judged(CONTENT_MISMATCH); }
+        if (info.signed_attributes.len > MAX_SIGNED_ATTRIBUTES_SIZE) {
+            ret judged(RESOURCE_LIMIT);
+        }
+        # the signature covers the attributes' der set, not their [0] tag
+        memory.copy[u8](?message[0], info.signed_attributes.data,
+            info.signed_attributes.len);
+        message[0] = 0x31;
+        signed     = contracts.Bytes{data: ?message[0], len: info.signed_attributes.len};
+    }
+    or (!have_content) { ret judged(INVALID_INPUT); }
+
+    val checked: path.Error = path.message(?leaf.public_key, info.signature_algorithm,
+        signed, info.signature);
+    if (checked == path.UNSUPPORTED_ALGORITHM) { ret judged(UNSUPPORTED_ALGORITHM); }
+    if (checked != path.OK)                    { ret judged(BAD_SIGNATURE); }
+    if (info.signing_certificate.len > 0) {
+        val referenced: Error = check_signing_certificate(?info, ?leaf);
+        if (referenced != OK) { ret judged(referenced); }
+    }
+    var presented: cert.Chain = cert.Chain{certificates: ?certificates[0], len: count};
+    val trusted:   path.Error = path.chain(options.trust, ?presented, ?options.chain);
+    if (trusted != path.OK) { ret Verdict{error: UNTRUSTED, chain: trusted}; }
+    if (output != nil)      { @output = info; }
+    ret judged(OK);
+}
+
+# verify every signer of a signed data
+#
+# each signer's certificate must be among the included certificates, its
+# signature must check under that certificate's key, its message digest must
+# match the content, a signing-certificate-v2 attribute must name it, and its
+# path must validate against the trust store with the chain options. first,
+# when not nil, receives the first signer's parsed info.
+pub fun verify(input: contracts.Bytes, options: *VerifyOptions, first: *SignerInfo) Verdict {
+    if (options == nil || options.trust == nil || options.form > DETACHED_DIGEST ||
+        !valid_bytes(options.content) || !valid_bytes(options.content_digest)) {
+        ret judged(INVALID_INPUT);
+    }
+    var value:  SignedData;
+    val parsed: Error = parse(input, ?value);
+    if (parsed != OK) { ret judged(parsed); }
+    var index: usize = 0;
+    for (index < value.signer_count) {
+        var output: *SignerInfo = nil;
+        if (index == 0) { output = first; }
+        val verdict: Verdict = verify_signer(?value, index, options, output);
+        if (verdict.error != OK) { ret verdict; }
+        index = index + 1;
+    }
+    ret judged(OK);
+}
+
+fun write_attached(value: *writer.Writer, signed_data: *SignedData, info: *SignerInfo,
+    attributes: *contracts.Bytes, count: usize) {
+    val outer: usize = writer.open(value);
+    writer.element(value, der.OBJECT_ID, contracts.Bytes{data: ?ID_SIGNED_DATA[0], len: 9});
+    val explicit: usize      = writer.open(value);
+    val signed:   usize      = writer.open(value);
+    var fields:   der.Cursor = der.cursor(signed_data.fields);
+    for (!der.complete(?fields)) {
+        var field: der.Element;
+        if (der.next(?fields, ?field) != contracts.OK) {
+            value.error = contracts.INVALID_INPUT;
+            ret;
+        }
+        if (!der.complete(?fields)) {
+            writer.raw(value, field.encoded);
+            cnt;
+        }
+        # the signer infos come last and hold the one signer
+        val infos:   usize = writer.open(value);
+        val signer:  usize = writer.open(value);
+        var element: der.Element;
+        if (!one(info.encoded, ?element)) {
+            value.error = contracts.INVALID_INPUT;
+            ret;
+        }
+        var body: der.Cursor = der.cursor(element.content);
+        for (!der.complete(?body)) {
+            var part: der.Element;
+            if (der.next(?body, ?part) != contracts.OK) {
+                value.error = contracts.INVALID_INPUT;
+                ret;
+            }
+            if (part.tag != 0xa1) { writer.raw(value, part.encoded); }
+        }
+        val unsigned: usize = writer.open(value);
+        var i:        usize = 0;
+        for (i < count) {
+            writer.raw(value, attributes[i]);
+            i = i + 1;
+        }
+        writer.close(value, unsigned, 0xa1);
+        writer.close(value, signer, der.SEQUENCE);
+        writer.close(value, infos, 0x31);
+    }
+    writer.close(value, signed, der.SEQUENCE);
+    writer.close(value, explicit, 0xa0);
+    writer.close(value, outer, der.SEQUENCE);
+}
+
+fun collect_attributes(input: contracts.Bytes, output: *contracts.Bytes,
+    count: *usize) Error {
+    var attributes: der.Cursor = der.cursor(input);
+    for (!der.complete(?attributes)) {
+        var attribute: der.Element;
+        var oid:       der.Element;
+        var values:    der.Element;
+        if (der.next(?attributes, ?attribute) != contracts.OK ||
+            !attribute_parts(?attribute, ?oid, ?values)) { ret INVALID_INPUT; }
+        if (@count == MAX_UNSIGNED_ATTRIBUTES) { ret RESOURCE_LIMIT; }
+        output[@count] = attribute.encoded;
+        @count         = @count + 1;
+    }
+    ret OK;
+}
+
+# add unsigned attributes to the sole signer of a signed data
+#
+# attributes holds one or more encoded Attribute values, such as an rfc 3161
+# time-stamp token over the signer's signature. they join any the signer
+# already carries, in der order. the signature and every other byte that is
+# signed stay as they were. input and output must not overlap.
+pub fun attach_unsigned(input: contracts.Bytes, attributes: contracts.Bytes,
+    output: contracts.Buffer) Result {
+    if (!valid_bytes(input) || attributes.len == 0 || attributes.data == nil ||
+        (output.capacity > 0 && output.data == nil) ||
+        memory.ranges_overlap(input.data, input.len, output.data, output.capacity)) {
+        ret built(INVALID_INPUT, 0, contract.OK);
+    }
+    var value:  SignedData;
+    var status: Error = parse(input, ?value);
+    if (status != OK)            { ret built(status, 0, contract.OK); }
+    if (value.signer_count != 1) { ret built(INVALID_INPUT, 0, contract.OK); }
+    var info: SignerInfo;
+    status = signer_info(?value, 0, ?info);
+    if (status != OK) { ret built(status, 0, contract.OK); }
+
+    var collected: [MAX_UNSIGNED_ATTRIBUTES]contracts.Bytes;
+    var count:     usize = 0;
+    if (info.unsigned_attributes.len > 0) {
+        var existing: der.Element;
+        if (!one(info.unsigned_attributes, ?existing)) { ret built(MALFORMED, 0, contract.OK); }
+        status = collect_attributes(existing.content, ?collected[0], ?count);
+        if (status != OK) { ret built(MALFORMED, 0, contract.OK); }
+    }
+    status = collect_attributes(attributes, ?collected[0], ?count);
+    if (status != OK) { ret built(status, 0, contract.OK); }
+    writer.sort(?collected[0], count);
+
+    var counter: writer.Writer = writer.measuring();
+    write_attached(?counter, ?value, ?info, ?collected[0], count);
+    if (counter.error != contracts.OK) { ret built(INVALID_INPUT, 0, contract.OK); }
+    if (counter.len > output.capacity) { ret built(OUTPUT_TOO_SMALL, counter.len, contract.OK); }
+    var encoded: writer.Writer = writer.into(output);
+    write_attached(?encoded, ?value, ?info, ?collected[0], count);
+    if (encoded.error != contracts.OK) { ret built(INVALID_INPUT, 0, contract.OK); }
+    ret built(OK, encoded.len, contract.OK);
+}
+
+#[testing]
+#[embed("../test/vectors/cms/root.der")]
+val ROOT:          [489]u8;
+#[testing]
+#[embed("../test/vectors/cms/content.txt")]
+val CONTENT:       [21]u8;
+#[testing]
+#[embed("../test/vectors/cms/ed25519.key")]
+val ED25519_KEY:   [119]u8;
+#[testing]
+#[embed("../test/vectors/cms/ed25519-chain.pem")]
+val ED25519_CHAIN: [1397]u8;
+#[testing]
+#[embed("../test/vectors/cms/p256.key")]
+val P256_KEY:      [241]u8;
+#[testing]
+#[embed("../test/vectors/cms/p256-chain.pem")]
+val P256_CHAIN:    [1462]u8;
+#[testing]
+#[embed("../test/vectors/cms/rsa.key")]
+val RSA_KEY:       [1704]u8;
+#[testing]
+#[embed("../test/vectors/cms/rsa-chain.pem")]
+val RSA_CHAIN:     [1734]u8;
+# what this module built and openssl verified, at signing-time 1790000000
+#[testing]
+#[embed("../test/vectors/cms/mach-ed25519-attached.der")]
+val MACH_ED25519_ATTACHED: [1418]u8;
+#[testing]
+#[embed("../test/vectors/cms/mach-p256-detached.der")]
+val MACH_P256_DETACHED:    [1419]u8;
+# what openssl cms -sign -binary made, with -nodetach for the attached ones
+#[testing]
+#[embed("../test/vectors/cms/openssl-ed25519-detached.der")]
+val OPENSSL_ED25519_DETACHED:    [1172]u8;
+#[testing]
+#[embed("../test/vectors/cms/openssl-p256-attached.der")]
+val OPENSSL_P256_ATTACHED:       [1022]u8;
+#[testing]
+#[embed("../test/vectors/cms/openssl-rsa-pkcs1-detached.der")]
+val OPENSSL_RSA_PKCS1_DETACHED:  [1387]u8;
+#[testing]
+#[embed("../test/vectors/cms/openssl-rsa-pss384-attached.der")]
+val OPENSSL_RSA_PSS384_ATTACHED: [1480]u8;
+
+#[testing]
+val SIGNING_TIME: i64 = 1790000000;
+
+#[testing]
+rec Fixture {
+    der:    [4096]u8;
+    owner:  secret.Allocator;
+    keyed:  key_signer.KeySigner;
+    signer: contract.Signer;
+}
+
+#[testing]
+fun open_fixture(fixture: *Fixture, key_pem: *u8, key_len: usize, chain_pem: *u8,
+    chain_len: usize) bool {
+    var key: [2048]^u8;
+    var i:   usize = 0;
+    for (i < key_len) {
+        key[i] = key_pem[i];
+        i      = i + 1;
+    }
+    fixture.owner = secret.system_allocator();
+    val opened: contract.Error = key_signer.open_pem(?fixture.keyed,
+        contracts.SecretBytes{data: ?key[0], len: key_len},
+        contracts.Bytes{data: chain_pem, len: chain_len},
+        contracts.Buffer{data: ?fixture.der[0], capacity: 4096}, ?fixture.owner);
+    if (opened != contract.OK) { ret false; }
+    fixture.signer = key_signer.signer(?fixture.keyed);
+    ret true;
+}
+
+#[testing]
+rec Trust {
+    anchor: cert.Certificate;
+    store:  cert.TrustStore;
+}
+
+#[testing]
+fun verify_options(trust: *Trust, form: Content) VerifyOptions {
+    trust.anchor = cert.Certificate{der: ?ROOT[0], der_len: 489};
+    trust.store  = cert.TrustStore{anchors: ?trust.anchor, len: 1};
+    var options: VerifyOptions;
+    options.trust                      = ?trust.store;
+    options.chain.purpose              = path.email_protection();
+    options.chain.now                  = time.unix(1800000000, 0);
+    options.chain.max_depth            = path.MAX_CHAIN_DEPTH;
+    options.chain.max_signature_checks = path.MAX_SIGNATURE_CHECKS;
+    options.form                       = form;
+    ret options;
+}
+
+#[testing]
+fun signing_options(algorithm: x509.SignatureAlgorithm, form: Content) Options {
+    var options: Options;
+    options.algorithm            = algorithm;
+    options.form                 = form;
+    options.content              = contracts.Bytes{data: ?CONTENT[0], len: 21};
+    options.signing_time_present = true;
+    options.signing_time         = time.unix(SIGNING_TIME, 0);
+    ret options;
+}
+
+# build in one form, verify, and see a change refused. 0 is success
+#[testing]
+fun round_trips(value: *contract.Signer, algorithm: x509.SignatureAlgorithm,
+    form: Content) i64 {
+    var options: Options = signing_options(algorithm, form);
+    var digest:  [64]u8;
+    if (form == DETACHED_DIGEST) {
+        if (!digest_of(digest_algorithm(algorithm), options.content, ?digest[0])) { ret 1; }
+        options.content_digest = contracts.Bytes{data: ?digest[0],
+            len: digest_size(digest_algorithm(algorithm))};
+        options.content = contracts.Bytes{data: nil, len: 0};
+    }
+    var output: [8192]u8;
+    val made:   Result = build(value, ?options,
+        contracts.Buffer{data: ?output[0], capacity: 8192});
+    if (made.error != OK) { ret 2; }
+    val encoded: contracts.Bytes = contracts.Bytes{data: ?output[0], len: made.written};
+
+    var trust:    Trust;
+    var checking: VerifyOptions = verify_options(?trust, form);
+    checking.content        = contracts.Bytes{data: ?CONTENT[0], len: 21};
+    checking.content_digest = options.content_digest;
+    var info: SignerInfo;
+    if (verify(encoded, ?checking, ?info).error != OK) { ret 3; }
+    if (info.signature_algorithm != algorithm || info.digest != digest_algorithm(algorithm) ||
+        !info.signing_time_present || info.signing_time.sec != SIGNING_TIME ||
+        info.signing_certificate.len == 0 || info.unsigned_attributes.len != 0) { ret 4; }
+
+    var other: [21]u8 = CONTENT;
+    other[0]                = 'M';
+    checking.content        = contracts.Bytes{data: ?other[0], len: 21};
+    checking.content_digest = contracts.Bytes{data: ?other[0], len: digest_size(info.digest)};
+    if (form == DETACHED_DIGEST) {
+        var longer: [64]u8;
+        checking.content_digest = contracts.Bytes{data: ?longer[0], len: digest_size(info.digest)};
+    }
+    if (form == ATTACHED) {
+        # the signature is the last element
+        output[made.written - 1] = output[made.written - 1] ^ 1;
+        if (verify(encoded, ?checking, nil).error != BAD_SIGNATURE) { ret 5; }
+        ret 0;
+    }
+    if (verify(encoded, ?checking, nil).error != CONTENT_MISMATCH) { ret 6; }
+    ret 0;
+}
+
+#[testing]
+fun every_form(value: *contract.Signer, algorithm: x509.SignatureAlgorithm) i64 {
+    var status: i64 = round_trips(value, algorithm, ATTACHED);
+    if (status == 0) { status = round_trips(value, algorithm, DETACHED); }
+    if (status == 0) { status = round_trips(value, algorithm, DETACHED_DIGEST); }
+    ret status;
+}
+
+test cms__builds_and_verifies_every_algorithm_the_signer_offers {
+    var ed25519: Fixture;
+    var p256:    Fixture;
+    var rsa:     Fixture;
+    if (!open_fixture(?ed25519, ?ED25519_KEY[0], 119, ?ED25519_CHAIN[0], 1397) ||
+        !open_fixture(?p256, ?P256_KEY[0], 241, ?P256_CHAIN[0], 1462) ||
+        !open_fixture(?rsa, ?RSA_KEY[0], 1704, ?RSA_CHAIN[0], 1734)) { ret 1; }
+    if (every_form(?ed25519.signer, x509.ED25519) != 0)        { ret 2; }
+    if (every_form(?p256.signer, x509.ECDSA_P256_SHA256) != 0) { ret 3; }
+    if (every_form(?rsa.signer, x509.RSA_PSS_SHA256) != 0)     { ret 4; }
+    if (every_form(?rsa.signer, x509.RSA_PSS_SHA384) != 0)     { ret 5; }
+
+    var options: Options = signing_options(x509.ECDSA_P256_SHA256, ATTACHED);
+    var output:  [8192]u8;
+    if (build(?ed25519.signer, ?options,
+        contracts.Buffer{data: ?output[0], capacity: 8192}).error != UNSUPPORTED_ALGORITHM) {
+        ret 7;
+    }
+    options.algorithm = x509.RSA_PKCS1_SHA256;
+    if (build(?rsa.signer, ?options,
+        contracts.Buffer{data: ?output[0], capacity: 8192}).error != UNSUPPORTED_ALGORITHM) {
+        ret 8;
+    }
+    # a short output reports the size needed before the signer is asked
+    options.algorithm = x509.SIGNATURE_NONE;
+    val short: Result = build(?ed25519.signer, ?options,
+        contracts.Buffer{data: ?output[0], capacity: 100});
+    if (short.error != OUTPUT_TOO_SMALL || short.written <= 100) { ret 9; }
+    val fitted: Result = build(?ed25519.signer, ?options,
+        contracts.Buffer{data: ?output[0], capacity: short.written});
+    if (fitted.error != OK || fitted.written != short.written) { ret 10; }
+    key_signer.close(?ed25519.keyed);
+    key_signer.close(?p256.keyed);
+    key_signer.close(?rsa.keyed);
+    ret 0;
+}
+
+#[testing]
+fun builds_exactly(fixture: *Fixture, algorithm: x509.SignatureAlgorithm, form: Content,
+    expected: *u8, expected_len: usize) bool {
+    var options: Options = signing_options(algorithm, form);
+    var output:  [4096]u8;
+    val made:    Result  = build(?fixture.signer, ?options,
+        contracts.Buffer{data: ?output[0], capacity: 4096});
+    ret made.error == OK && bytes_equal(contracts.Bytes{data: ?output[0], len: made.written},
+        contracts.Bytes{data: expected, len: expected_len});
+}
+
+test cms__the_same_inputs_build_the_bytes_openssl_verified {
+    var ed25519: Fixture;
+    var p256:    Fixture;
+    if (!open_fixture(?ed25519, ?ED25519_KEY[0], 119, ?ED25519_CHAIN[0], 1397) ||
+        !open_fixture(?p256, ?P256_KEY[0], 241, ?P256_CHAIN[0], 1462)) { ret 1; }
+    if (!builds_exactly(?ed25519, x509.ED25519, ATTACHED, ?MACH_ED25519_ATTACHED[0], 1418)) {
+        ret 2;
+    }
+    if (!builds_exactly(?p256, x509.ECDSA_P256_SHA256, DETACHED, ?MACH_P256_DETACHED[0], 1419)) {
+        ret 3;
+    }
+    key_signer.close(?ed25519.keyed);
+    key_signer.close(?p256.keyed);
+    ret 0;
+}
+
+#[testing]
+fun openssl_verdict(signed: *u8, signed_len: usize, form: Content,
+    content: contracts.Bytes, info: *SignerInfo) Error {
+    var trust:   Trust;
+    var options: VerifyOptions = verify_options(?trust, form);
+    options.content = content;
+    ret verify(contracts.Bytes{data: signed, len: signed_len}, ?options, info).error;
+}
+
+test cms__verifies_what_openssl_signs {
+    val content: contracts.Bytes = contracts.Bytes{data: ?CONTENT[0], len: 21};
+    val none:    contracts.Bytes = contracts.Bytes{data: nil, len: 0};
+    var info:    SignerInfo;
+    # ed25519 with -cades: a signing-certificate-v2 with a sha-512 hash and an
+    # issuer serial
+    if (openssl_verdict(?OPENSSL_ED25519_DETACHED[0], 1172, DETACHED, content, ?info) != OK ||
+        info.signature_algorithm != x509.ED25519 || info.digest != SHA512 ||
+        info.signing_certificate.len == 0 || !info.signing_time_present) { ret 1; }
+    if (openssl_verdict(?OPENSSL_P256_ATTACHED[0], 1022, ATTACHED, none, ?info) != OK ||
+        info.signature_algorithm != x509.ECDSA_P256_SHA256) { ret 2; }
+    # rsaEncryption names pkcs #1 v1.5 with the digest algorithm's hash
+    if (openssl_verdict(?OPENSSL_RSA_PKCS1_DETACHED[0], 1387, DETACHED, content, ?info) != OK ||
+        info.signature_algorithm != x509.RSA_PKCS1_SHA256) { ret 3; }
+    if (openssl_verdict(?OPENSSL_RSA_PSS384_ATTACHED[0], 1480, ATTACHED, none, ?info) != OK ||
+        info.signature_algorithm != x509.RSA_PSS_SHA384 || info.digest != SHA384) { ret 4; }
+
+    var other: [21]u8 = CONTENT;
+    other[20] = '!';
+    if (openssl_verdict(?OPENSSL_ED25519_DETACHED[0], 1172, DETACHED,
+        contracts.Bytes{data: ?other[0], len: 21}, nil) != CONTENT_MISMATCH) { ret 5; }
+    if (openssl_verdict(?OPENSSL_P256_ATTACHED[0], 1022, DETACHED, content, nil) !=
+        INVALID_INPUT ||
+        openssl_verdict(?OPENSSL_ED25519_DETACHED[0], 1172, ATTACHED, none, nil) !=
+        INVALID_INPUT) { ret 6; }
+    if (openssl_verdict(?OPENSSL_P256_ATTACHED[0], 1021, ATTACHED, none, nil) != MALFORMED) {
+        ret 7;
+    }
+    var trust:   Trust;
+    var options: VerifyOptions = verify_options(?trust, ATTACHED);
+    options.chain.now = time.unix(1700000000, 0);
+    val early: Verdict = verify(contracts.Bytes{data: ?OPENSSL_P256_ATTACHED[0], len: 1022},
+        ?options, nil);
+    if (early.error != UNTRUSTED || early.chain != path.CERTIFICATE_EXPIRED) { ret 8; }
+    ret 0;
+}
+
+# an attribute of type 1.2.3.4 holding one octet string
+#[testing]
+val TEST_ATTRIBUTE: [11]u8 = [11]u8{
+    0x30, 0x09, 0x06, 0x03, 0x2a, 0x03, 0x04, 0x31, 0x02, 0x04, 0x00,
+};
+# an attribute of type 1.2.3 holding one null
+#[testing]
+val OTHER_ATTRIBUTE: [10]u8 = [10]u8{
+    0x30, 0x08, 0x06, 0x02, 0x2a, 0x03, 0x31, 0x02, 0x05, 0x00,
+};
+
+test cms__unsigned_attributes_attach_after_signing {
+    var trust:   Trust;
+    var options: VerifyOptions   = verify_options(?trust, ATTACHED);
+    val signed:  contracts.Bytes = contracts.Bytes{data: ?MACH_ED25519_ATTACHED[0], len: 1418};
+    var before:  SignerInfo;
+    if (verify(signed, ?options, ?before).error != OK) { ret 1; }
+
+    var once:      [2048]u8;
+    val attribute: contracts.Bytes = contracts.Bytes{data: ?TEST_ATTRIBUTE[0], len: 11};
+    val short:     Result          = attach_unsigned(signed, attribute,
+        contracts.Buffer{data: ?once[0], capacity: 1418});
+    if (short.error != OUTPUT_TOO_SMALL || short.written <= 1418) { ret 2; }
+    val first: Result = attach_unsigned(signed, attribute,
+        contracts.Buffer{data: ?once[0], capacity: short.written});
+    if (first.error != OK || first.written != short.written) { ret 3; }
+    var twice:  [2048]u8;
+    val second: Result = attach_unsigned(contracts.Bytes{data: ?once[0], len: first.written},
+        contracts.Bytes{data: ?OTHER_ATTRIBUTE[0], len: 10},
+        contracts.Buffer{data: ?twice[0], capacity: 2048});
+    if (second.error != OK) { ret 4; }
+
+    var after: SignerInfo;
+    if (verify(contracts.Bytes{data: ?twice[0], len: second.written}, ?options,
+        ?after).error != OK || !bytes_equal(after.signature, before.signature) ||
+        !bytes_equal(after.signed_attributes, before.signed_attributes)) { ret 5; }
+    # the shorter encoding sorts first in the der set
+    var attributes: der.Element;
+    if (!one(after.unsigned_attributes, ?attributes) || attributes.content.len != 21 ||
+        !bytes_equal(contracts.Bytes{data: attributes.content.data, len: 10},
+        contracts.Bytes{data: ?OTHER_ATTRIBUTE[0], len: 10})) { ret 6; }
+
+    var malformed: [3]u8 = [3]u8{0x30, 0x01, 0x05};
+    if (attach_unsigned(signed, contracts.Bytes{data: ?malformed[0], len: 3},
+        contracts.Buffer{data: ?once[0], capacity: 2048}).error != INVALID_INPUT) { ret 7; }
+    ret 0;
+}
