@@ -8,3 +8,4 @@ fwd pki.x509;
 fwd pki.load;
 fwd pki.verify;
 fwd pki.signer;
+fwd pki.key_signer;
