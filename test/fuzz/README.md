@@ -7,6 +7,7 @@ point of the library. Each directory pairs with a row of the registry in
 | boundary | entry point |
 |---|---|
 | `x509` | `x509.parse` |
+| `cms` | `cms.parse`, `cms.signer_info`, `cms.verify` and `cms.encoded_length` |
 
 ## Answers
 
@@ -51,9 +52,14 @@ one.
 
 ## The corpus
 
-The named files are valid certificates in DER, each accepted by the parser. The
+In `x509`, the named files are valid certificates in DER, each accepted by the parser. The
 `m-*` files were retained by mutation. The corpus came from mach-tls, where this
 boundary was `cert.x509.parse`.
+
+The `cms` named files are the signed data of `test/vectors/cms`, in der and in ber,
+including genuine okular signatures with indefinite lengths. `cms.verify` runs
+against an empty trust store, so the walk of the content, the signature and the
+signed attributes is covered and no input reaches a trusted anchor.
 
 To retain a new input by hand, put the file in its boundary's directory. When a
 finding is fixed, retain the input that found it, so the replay keeps it fixed.

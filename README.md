@@ -243,6 +243,15 @@ identifier, and RSA PKCS #1 v1.5 named by `rsaEncryption`. `cms.parse` and
 `cms.signer_info` read signed data without verifying it, for a caller that
 needs the digest algorithm before it hashes detached content.
 
+Signed data may be BER, as NSS (Okular, poppler), Acrobat and other pdf tools
+write it: indefinite lengths and octet strings built from segments are read in
+the envelope. What a signature covers stays strict DER: the signed attributes,
+the signer's issuer name and the certificates are refused otherwise. Nesting is
+bounded and every read is checked against the input. `cms.encoded_length` gives
+the length of the BER or DER element at the start of a buffer, for signed data
+followed by padding. `cms.attach_unsigned` rewrites DER signed data and refuses
+BER it cannot.
+
 ```mach
 use crypto.contracts;
 use pki.cms;
