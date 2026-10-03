@@ -1,0 +1,223 @@
+# signing contract that never exposes a key
+#
+# a signer is a private key held anywhere: in memory, on a pkcs #11 token, in
+# an hsm or behind a remote signing service. callers see only the bytes they
+# hand it, the signature it returns and its certificate chain. the signer
+# hashes when its algorithm hashes first. an implementation backed by a device
+# or service that accepts only digests hashes locally before sending, and one
+# that takes the message (ed25519, rfc 8419) sends it unchanged.
+#
+# the chain and the algorithm list are fixed once a signer is open: an
+# implementation that fetches them does so when it opens, so a caller can
+# build signed attributes from the leaf before it signs. only sign may block,
+# and only sign may fail transiently.
+
+use crypto.contracts;
+use pki.cert;
+use pki.x509;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub def Error: u8;
+
+pub val OK: Error = 0;
+# the caller passed a malformed argument
+pub val INVALID_INPUT: Error = 1;
+# the output cannot hold the signature. written reports the size needed
+pub val OUTPUT_TOO_SMALL: Error = 2;
+# the key cannot sign with the requested algorithm
+pub val UNSUPPORTED_ALGORITHM: Error = 3;
+# the signer could not be reached or was busy. the same call may succeed later
+pub val UNAVAILABLE: Error = 4;
+# the signer refused: unauthorized, locked, or refused by policy
+pub val DENIED: Error = 5;
+# the signer failed and retrying the same call will not help
+pub val FAILED: Error = 6;
+# the private key does not belong to the leaf certificate
+pub val KEY_MISMATCH: Error = 7;
+
+pub rec Result {
+    error:   Error;
+    written: usize;
+}
+
+# the index-th supported algorithm in preference order, x509.SIGNATURE_NONE
+# past the last
+pub def AlgorithmFun: fun(ptr, usize) x509.SignatureAlgorithm;
+
+# the leaf-first certificate chain, borrowed for as long as the signer is open
+pub def ChainFun: fun(ptr) cert.Chain;
+
+# the largest signature the algorithm can produce, 0 when unsupported
+pub def SignatureSizeFun: fun(ptr, x509.SignatureAlgorithm) usize;
+
+# sign the message with the algorithm into the output. may block
+pub def SignFun: fun(ptr, *^u8, x509.SignatureAlgorithm, contracts.Bytes,
+    contracts.Buffer) Result;
+
+# an open signer. context is the implementation's public state and
+# secret_context its secret state, which an untyped ptr cannot carry. both
+# outlive the value
+pub rec Signer {
+    context:           ptr;
+    secret_context:    *^u8;
+    algorithm_fn:      AlgorithmFun;
+    chain_fn:          ChainFun;
+    signature_size_fn: SignatureSizeFun;
+    sign_fn:           SignFun;
+}
+
+fun failed(error: Error, written: usize) Result {
+    ret Result{error: error, written: written};
+}
+
+fun valid(value: *Signer) bool {
+    ret value != nil && value.algorithm_fn != nil && value.chain_fn != nil &&
+        value.signature_size_fn != nil && value.sign_fn != nil;
+}
+
+# report whether a retry of the same call may succeed
+pub fun transient(error: Error) bool {
+    ret error == UNAVAILABLE;
+}
+
+# the index-th supported algorithm in the signer's preference order
+pub fun algorithm(value: *Signer, index: usize) x509.SignatureAlgorithm {
+    if (!valid(value)) { ret x509.SIGNATURE_NONE; }
+    ret value.algorithm_fn(value.context, index);
+}
+
+# report whether the signer's key signs with the algorithm
+pub fun supports(value: *Signer, wanted: x509.SignatureAlgorithm) bool {
+    if (!valid(value) || wanted == x509.SIGNATURE_NONE) { ret false; }
+    var index: usize = 0;
+    for {
+        val listed: x509.SignatureAlgorithm = value.algorithm_fn(value.context, index);
+        if (listed == x509.SIGNATURE_NONE) { ret false; }
+        if (listed == wanted)              { ret true; }
+        index = index + 1;
+    }
+    ret false;
+}
+
+# the signer's leaf-first certificate chain
+pub fun chain(value: *Signer) cert.Chain {
+    var empty: cert.Chain;
+    if (!valid(value)) { ret empty; }
+    ret value.chain_fn(value.context);
+}
+
+# the largest signature the signer produces with the algorithm, 0 when
+# unsupported
+pub fun signature_size(value: *Signer, wanted: x509.SignatureAlgorithm) usize {
+    if (!valid(value)) { ret 0; }
+    ret value.signature_size_fn(value.context, wanted);
+}
+
+# sign message with the algorithm into output
+#
+# an unsupported algorithm or a short output fails before the signer is
+# reached, so a remote signer is never asked for a signature that cannot land.
+pub fun sign(value: *Signer, wanted: x509.SignatureAlgorithm,
+    message: contracts.Bytes, output: contracts.Buffer) Result {
+    if (!valid(value) || (message.len != 0 && message.data == nil)) {
+        ret failed(INVALID_INPUT, 0);
+    }
+    val size: usize = value.signature_size_fn(value.context, wanted);
+    if (size == 0)              { ret failed(UNSUPPORTED_ALGORITHM, 0); }
+    if (output.capacity < size) { ret failed(OUTPUT_TOO_SMALL, size); }
+    if (output.data == nil)     { ret failed(INVALID_INPUT, 0); }
+    ret value.sign_fn(value.context, value.secret_context, wanted, message, output);
+}
+
+#[testing]
+rec RemoteSigner {
+    certificate:  cert.Certificate;
+    calls:        usize;
+    busy_calls:   usize;
+    last_message: contracts.Bytes;
+}
+
+#[testing]
+fun remote_algorithm(context: ptr, index: usize) x509.SignatureAlgorithm {
+    if (index == 0) { ret x509.ECDSA_P384_SHA384; }
+    if (index == 1) { ret x509.RSA_PKCS1_SHA256; }
+    ret x509.SIGNATURE_NONE;
+}
+
+#[testing]
+fun remote_chain(context: ptr) cert.Chain {
+    val remote: *RemoteSigner = context::*RemoteSigner;
+    ret cert.Chain{certificates: ?remote.certificate, len: 1};
+}
+
+#[testing]
+fun remote_signature_size(context: ptr, wanted: x509.SignatureAlgorithm) usize {
+    if (wanted == x509.ECDSA_P384_SHA384) { ret 104; }
+    if (wanted == x509.RSA_PKCS1_SHA256)  { ret 256; }
+    ret 0;
+}
+
+# a service that is busy for its first calls, then answers with a fixed
+# signature
+#[testing]
+fun remote_sign(context: ptr, secret_context: *^u8, wanted: x509.SignatureAlgorithm,
+    message: contracts.Bytes, output: contracts.Buffer) Result {
+    val remote: *RemoteSigner = context::*RemoteSigner;
+    remote.calls        = remote.calls + 1;
+    remote.last_message = message;
+    if (remote.calls <= remote.busy_calls) { ret failed(UNAVAILABLE, 0); }
+    var i: usize = 0;
+    for (i < 8) {
+        output.data[i] = 0xa0 + i::u8;
+        i              = i + 1;
+    }
+    ret Result{error: OK, written: 8};
+}
+
+test signer__a_signer_without_a_key_drops_in {
+    var der:    [3]u8        = [3]u8{0x30, 0x01, 0x00};
+    var remote: RemoteSigner = RemoteSigner{
+        certificate:  cert.Certificate{der: ?der[0], der_len: 3},
+        calls:        0,
+        busy_calls:   1,
+        last_message: contracts.Bytes{data: nil, len: 0},
+    };
+    var value: Signer = Signer{
+        context:           (?remote)::ptr,
+        secret_context:    nil,
+        algorithm_fn:      remote_algorithm,
+        chain_fn:          remote_chain,
+        signature_size_fn: remote_signature_size,
+        sign_fn:           remote_sign,
+    };
+    if (algorithm(?value, 0) != x509.ECDSA_P384_SHA384 ||
+        algorithm(?value, 2) != x509.SIGNATURE_NONE ||
+        !supports(?value, x509.RSA_PKCS1_SHA256) ||
+        supports(?value, x509.ED25519)) { ret 1; }
+    val presented: cert.Chain = chain(?value);
+    if (presented.len != 1 || presented.certificates[0].der != ?der[0]) { ret 2; }
+
+    var message: [5]u8           = [5]u8{'h', 'e', 'l', 'l', 'o'};
+    var output:  [104]u8;
+    val bytes:   contracts.Bytes = contracts.Bytes{data: ?message[0], len: 5};
+    val short:   Result          = sign(?value, x509.ECDSA_P384_SHA384, bytes,
+        contracts.Buffer{data: ?output[0], capacity: 103});
+    val unsupported: Result = sign(?value, x509.ED25519, bytes,
+        contracts.Buffer{data: ?output[0], capacity: 104});
+    if (short.error != OUTPUT_TOO_SMALL || short.written != 104 ||
+        unsupported.error != UNSUPPORTED_ALGORITHM || remote.calls != 0) { ret 3; }
+
+    var attempt: Result = sign(?value, x509.ECDSA_P384_SHA384, bytes,
+        contracts.Buffer{data: ?output[0], capacity: 104});
+    if (attempt.error != UNAVAILABLE || !transient(attempt.error)) { ret 4; }
+    attempt = sign(?value, x509.ECDSA_P384_SHA384, bytes,
+        contracts.Buffer{data: ?output[0], capacity: 104});
+    if (attempt.error != OK || attempt.written != 8 || output[7] != 0xa7 ||
+        remote.calls != 2 || remote.last_message.data != ?message[0] ||
+        remote.last_message.len != 5) { ret 5; }
+    if (transient(DENIED) || transient(FAILED)) { ret 6; }
+    ret 0;
+}

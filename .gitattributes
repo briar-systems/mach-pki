@@ -3,3 +3,4 @@
 * text=auto eol=lf
 # fuzz inputs are bytes, some of them deliberately CRLF or invalid text
 test/fuzz/corpus/** -text
+test/vectors/** -text

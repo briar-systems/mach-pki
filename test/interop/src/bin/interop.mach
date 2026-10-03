@@ -1,0 +1,171 @@
+# cms interop with openssl: sign signed data for openssl to verify, and verify
+# signed data openssl made
+#
+#   interop sign <key.pem> <chain.pem> <content> <attached|detached> <algorithm> <out>
+#   interop verify <signed.der> <root.pem> <content|->
+#
+# the algorithm is ed25519, p256, pss256 or pss384. signing-time is fixed, so
+# ed25519 and p-256 output is the same on every run. exit 0 is success, 1 a
+# usage or input error, 2 a refused signature
+
+use crypto.contracts;
+use crypto.secret;
+use pki.cert;
+use pki.cms;
+use pki.key_signer;
+use pki.load;
+use pki.signer;
+use pki.verify;
+use pki.x509;
+use std.allocator.page;
+use std.chrono.time;
+use std.collections.vector.Vector;
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A:  std.allocator;
+use fs: std.filesystem;
+
+val FAILED:  i64 = 1;
+val REFUSED: i64 = 2;
+
+# the signing-time every signature carries: 2026-09-21T14:13:20Z
+val SIGNING_TIME: i64 = 1790000000;
+# the time certificate paths are validated at: 2027-01-15T08:00:00Z
+val VALIDATION_TIME: i64 = 1800000000;
+
+var backing: A.Allocator;
+
+fun read(path: str, output: *Vector[u8]) bool {
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(?backing, path);
+    if (sel read.err) {
+        print.eprintlnf("interop: cannot read {}", path);
+        ret false;
+    }
+    @output = read.ok;
+    ret true;
+}
+
+fun algorithm_named(name: str) x509.SignatureAlgorithm {
+    if (str_equals(name, "ed25519")) { ret x509.ED25519; }
+    if (str_equals(name, "p256"))    { ret x509.ECDSA_P256_SHA256; }
+    if (str_equals(name, "pss256"))  { ret x509.RSA_PSS_SHA256; }
+    if (str_equals(name, "pss384"))  { ret x509.RSA_PSS_SHA384; }
+    ret x509.SIGNATURE_NONE;
+}
+
+fun sign(key_path: str, chain_path: str, content_path: str, form: str, name: str,
+    out: str) i64 {
+    var key:     Vector[u8];
+    var chain:   Vector[u8];
+    var content: Vector[u8];
+    if (!read(key_path, ?key) || !read(chain_path, ?chain) ||
+        !read(content_path, ?content)) { ret FAILED; }
+    if (key.len > 8192) { ret FAILED; }
+    var secret_key: [8192]^u8;
+    var i:          usize = 0;
+    for (i < key.len) {
+        secret_key[i] = key.data[i];
+        i             = i + 1;
+    }
+    var der:    [16384]u8;
+    var owner:  secret.Allocator = secret.system_allocator();
+    var keyed:  key_signer.KeySigner;
+    val opened: signer.Error     = key_signer.open_pem(?keyed,
+        contracts.SecretBytes{data: ?secret_key[0], len: key.len},
+        contracts.Bytes{data: chain.data, len: chain.len},
+        contracts.Buffer{data: ?der[0], capacity: 16384}, ?owner);
+    if (opened != signer.OK) {
+        print.eprintln("interop: cannot open the signer");
+        ret FAILED;
+    }
+    var value:   signer.Signer = key_signer.signer(?keyed);
+    var options: cms.Options;
+    options.algorithm            = algorithm_named(name);
+    options.form                 = cms.ATTACHED;
+    options.content              = contracts.Bytes{data: content.data, len: content.len};
+    options.signing_time_present = true;
+    options.signing_time         = time.unix(SIGNING_TIME, 0);
+    if (str_equals(form, "detached")) { options.form = cms.DETACHED; }
+    var output: [65536]u8;
+    val built:  cms.Result = cms.build(?value, ?options,
+        contracts.Buffer{data: ?output[0], capacity: 65536});
+    key_signer.close(?keyed);
+    if (built.error != cms.OK) {
+        print.eprintlnf("interop: build failed with {}", built.error);
+        ret FAILED;
+    }
+    val written: err[fs.FsError] = fs.write_bytes(out, ?output[0], built.written, 420);
+    if (sel written.err) {
+        print.eprintlnf("interop: cannot write {}", out);
+        ret FAILED;
+    }
+    ret 0;
+}
+
+fun check(signed_path: str, root_path: str, content_path: str) i64 {
+    var signed: Vector[u8];
+    var root:   Vector[u8];
+    if (!read(signed_path, ?signed) || !read(root_path, ?root)) { ret FAILED; }
+    var der:    [8192]u8;
+    var anchor: cert.Certificate;
+    val loaded: contracts.Operation = load.certificate_pem(
+        contracts.Bytes{data: root.data, len: root.len},
+        contracts.Buffer{data: ?der[0], capacity: 8192}, ?anchor);
+    if (loaded.error != contracts.OK) {
+        print.eprintln("interop: cannot load the root");
+        ret FAILED;
+    }
+    var options: cms.VerifyOptions;
+    var trust:   cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    options.trust                      = ?trust;
+    options.chain.purpose              = verify.email_protection();
+    options.chain.now                  = time.unix(VALIDATION_TIME, 0);
+    options.chain.max_depth            = verify.MAX_CHAIN_DEPTH;
+    options.chain.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
+    options.form                       = cms.ATTACHED;
+    var content: Vector[u8];
+    if (!str_equals(content_path, "-")) {
+        if (!read(content_path, ?content)) { ret FAILED; }
+        options.form    = cms.DETACHED;
+        options.content = contracts.Bytes{data: content.data, len: content.len};
+    }
+    val verdict: cms.Verdict = cms.verify(contracts.Bytes{data: signed.data, len: signed.len},
+        ?options, nil);
+    if (verdict.error != cms.OK) {
+        print.eprintlnf("interop: {} refused with {} (chain {})", signed_path, verdict.error,
+            verdict.chain);
+        ret REFUSED;
+    }
+    ret 0;
+}
+
+fun usage() i64 {
+    print.eprintln("usage: interop sign <key.pem> <chain.pem> <content> <attached|detached> <algorithm> <out>");
+    print.eprintln("       interop verify <signed.der> <root.pem> <content|->");
+    ret FAILED;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val made: err[A.Error] = page.make(?backing);
+    if (sel made.err) { ret FAILED; }
+    if (argc < 2)     { ret usage(); }
+    val mode: str = argv[1]::usize::str;
+    if (str_equals(mode, "sign") && argc == 8) {
+        ret sign(argv[2]::usize::str, argv[3]::usize::str, argv[4]::usize::str,
+            argv[5]::usize::str, argv[6]::usize::str, argv[7]::usize::str);
+    }
+    if (str_equals(mode, "verify") && argc == 5) {
+        ret check(argv[2]::usize::str, argv[3]::usize::str, argv[4]::usize::str);
+    }
+    ret usage();
+}
