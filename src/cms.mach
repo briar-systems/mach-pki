@@ -7,14 +7,18 @@
 # such as an rfc 3161 time-stamp token over the signature, are attached after
 # signing.
 #
-# parsing borrows its input and is strict der. verification checks every
-# signer's signature with verify.message and its certificate path with
-# verify.chain.
+# parsing borrows its input. the envelope may be ber, as nss, acrobat and
+# other pdf tools write it: indefinite lengths, lengths that are not minimal and
+# octet strings built from segments. what a signature covers stays strict der:
+# the signed attributes, which are hashed as a der set, and the certificates and
+# the signer's issuer name. verification checks every signer's signature with
+# verify.message and its certificate path with verify.chain.
 
 use crypto.contracts;
 use crypto.encoding.der;
 use crypto.hash;
 use crypto.secret;
+use pki.ber;
 use pki.cert;
 use pki.key_signer;
 use contract: pki.signer;
@@ -132,7 +136,10 @@ pub rec SignedData {
     # the encapsulated content type, as object identifier content
     content_type:    contracts.Bytes;
     content_present: bool;
-    content:         contracts.Bytes;
+    # the content when it is one primitive octet string, empty when it is
+    # built from segments. content_string is either, as encoded
+    content:        contracts.Bytes;
+    content_string: der.Element;
     # the certificate choices, concatenated, empty when absent
     certificates: contracts.Bytes;
     # the signer infos, concatenated
@@ -154,7 +161,10 @@ pub rec SignerInfo {
     # the encoded [0] signed attributes, empty when absent
     signed_attributes:   contracts.Bytes;
     signature_algorithm: x509.SignatureAlgorithm;
-    signature:           contracts.Bytes;
+    # the signature when it is one primitive octet string, empty when it is
+    # built from segments. signature_string is either, as encoded
+    signature:        contracts.Bytes;
+    signature_string: der.Element;
     # the encoded [1] unsigned attributes, empty when absent
     unsigned_attributes:  contracts.Bytes;
     message_digest:       contracts.Bytes;
@@ -230,6 +240,12 @@ fun one(input: contracts.Bytes, output: *der.Element) bool {
     ret der.next(?value, output) == contracts.OK && der.complete(?value);
 }
 
+# the single element that spans input, in ber
+fun one_ber(input: contracts.Bytes, output: *der.Element) bool {
+    var value: ber.Cursor = ber.cursor(input);
+    ret ber.next(?value, output) == contracts.OK && ber.complete(?value);
+}
+
 fun null_or_absent(body: *der.Cursor) bool {
     if (der.complete(body)) { ret true; }
     var parameter: der.Element;
@@ -238,6 +254,41 @@ fun null_or_absent(body: *der.Cursor) bool {
 }
 
 # the digest algorithm whose identifier is element, DIGEST_NONE when unknown
+val CONSTRUCTED_OCTET_STRING: der.Tag = 0x24;
+
+# an octet string, primitive or built from segments
+fun is_octet_string(element: *der.Element) bool {
+    ret element.tag == der.OCTET_STRING || element.tag == CONSTRUCTED_OCTET_STRING;
+}
+
+# feed a digest, or fill a buffer, with the octets of an octet string, joining
+# the segments of a constructed one in order. exactly one of digest and output
+# is not nil. output receives at most capacity octets and written counts them
+fun string_octets(element: *der.Element, depth: usize, digest: *Digest, output: *u8,
+    capacity: usize, written: *usize) Error {
+    if (element.tag == der.OCTET_STRING) {
+        if (digest != nil) {
+            if (digest_update(digest, element.content) != contracts.OK) { ret INVALID_INPUT; }
+            ret OK;
+        }
+        if (element.content.len > capacity - @written) { ret RESOURCE_LIMIT; }
+        if (element.content.len > 0) {
+            memory.copy[u8](?output[@written], element.content.data, element.content.len);
+        }
+        @written = @written + element.content.len;
+        ret OK;
+    }
+    if (element.tag != CONSTRUCTED_OCTET_STRING || depth >= ber.MAX_DEPTH) { ret MALFORMED; }
+    var segments: ber.Cursor = ber.cursor(element.content);
+    for (!ber.complete(?segments)) {
+        var segment: der.Element;
+        if (ber.next(?segments, ?segment) != contracts.OK) { ret MALFORMED; }
+        val status: Error = string_octets(?segment, depth + 1, digest, output, capacity, written);
+        if (status != OK) { ret status; }
+    }
+    ret OK;
+}
+
 fun parse_digest_algorithm(element: *der.Element) DigestAlgorithm {
     if (element.tag != der.SEQUENCE) { ret DIGEST_NONE; }
     var body: der.Cursor = der.cursor(element.content);
@@ -614,77 +665,78 @@ pub fun build(value: *contract.Signer, options: *Options,
 pub fun parse(input: contracts.Bytes, output: *SignedData) Error {
     if (output == nil || !valid_bytes(input)) { ret INVALID_INPUT; }
     var info: der.Element;
-    if (!one(input, ?info) || info.tag != der.SEQUENCE) { ret MALFORMED; }
-    var outer:    der.Cursor = der.cursor(info.content);
+    if (!one_ber(input, ?info) || info.tag != der.SEQUENCE) { ret MALFORMED; }
+    var outer:    ber.Cursor = ber.cursor(info.content);
     var oid:      der.Element;
     var explicit: der.Element;
     var signed:   der.Element;
-    if (der.next(?outer, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+    if (ber.next(?outer, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
         !oid_is(oid.content, ?ID_SIGNED_DATA[0], 9) ||
-        der.next(?outer, ?explicit) != contracts.OK || explicit.tag != 0xa0 ||
-        !der.complete(?outer) || !one(explicit.content, ?signed) ||
+        ber.next(?outer, ?explicit) != contracts.OK || explicit.tag != 0xa0 ||
+        !ber.complete(?outer) || !one_ber(explicit.content, ?signed) ||
         signed.tag != der.SEQUENCE) { ret MALFORMED; }
 
     var parsed: SignedData;
     parsed.fields = signed.content;
-    var fields:       der.Cursor = der.cursor(signed.content);
+    var fields:       ber.Cursor = ber.cursor(signed.content);
     var version:      der.Element;
     var digests:      der.Element;
     var encapsulated: der.Element;
-    if (der.next(?fields, ?version) != contracts.OK || version.tag != der.INTEGER ||
+    if (ber.next(?fields, ?version) != contracts.OK || version.tag != der.INTEGER ||
         version.content.len != 1 ||
         (version.content.data[0] != 1 && version.content.data[0] != 3 &&
         version.content.data[0] != 4 && version.content.data[0] != 5) ||
-        der.next(?fields, ?digests) != contracts.OK || digests.tag != 0x31 ||
-        der.next(?fields, ?encapsulated) != contracts.OK ||
+        ber.next(?fields, ?digests) != contracts.OK || digests.tag != 0x31 ||
+        ber.next(?fields, ?encapsulated) != contracts.OK ||
         encapsulated.tag != der.SEQUENCE) { ret MALFORMED; }
     parsed.version = version.content.data[0];
-    var digest_body: der.Cursor = der.cursor(digests.content);
-    for (!der.complete(?digest_body)) {
+    var digest_body: ber.Cursor = ber.cursor(digests.content);
+    for (!ber.complete(?digest_body)) {
         var listed: der.Element;
-        if (der.next(?digest_body, ?listed) != contracts.OK || listed.tag != der.SEQUENCE) {
+        if (ber.next(?digest_body, ?listed) != contracts.OK || listed.tag != der.SEQUENCE) {
             ret MALFORMED;
         }
     }
 
-    var encapsulated_body: der.Cursor = der.cursor(encapsulated.content);
+    var encapsulated_body: ber.Cursor = ber.cursor(encapsulated.content);
     var content_type:      der.Element;
-    if (der.next(?encapsulated_body, ?content_type) != contracts.OK ||
+    if (ber.next(?encapsulated_body, ?content_type) != contracts.OK ||
         content_type.tag != der.OBJECT_ID) { ret MALFORMED; }
     parsed.content_type = content_type.content;
-    if (!der.complete(?encapsulated_body)) {
+    if (!ber.complete(?encapsulated_body)) {
         var wrapped: der.Element;
         var content: der.Element;
-        if (der.next(?encapsulated_body, ?wrapped) != contracts.OK || wrapped.tag != 0xa0 ||
-            !der.complete(?encapsulated_body) || !one(wrapped.content, ?content) ||
-            content.tag != der.OCTET_STRING) { ret MALFORMED; }
+        if (ber.next(?encapsulated_body, ?wrapped) != contracts.OK || wrapped.tag != 0xa0 ||
+            !ber.complete(?encapsulated_body) || !one_ber(wrapped.content, ?content) ||
+            !is_octet_string(?content)) { ret MALFORMED; }
         parsed.content_present = true;
-        parsed.content         = content.content;
+        parsed.content_string  = content;
+        if (content.tag == der.OCTET_STRING) { parsed.content = content.content; }
     }
 
     var current: der.Element;
-    if (der.next(?fields, ?current) != contracts.OK) { ret MALFORMED; }
+    if (ber.next(?fields, ?current) != contracts.OK) { ret MALFORMED; }
     if (current.tag == 0xa0) {
         parsed.certificates = current.content;
-        var choices: der.Cursor = der.cursor(current.content);
-        for (!der.complete(?choices)) {
+        var choices: ber.Cursor = ber.cursor(current.content);
+        for (!ber.complete(?choices)) {
             var choice: der.Element;
-            if (der.next(?choices, ?choice) != contracts.OK ||
+            if (ber.next(?choices, ?choice) != contracts.OK ||
                 (choice.tag != der.SEQUENCE && (choice.tag < 0xa0 || choice.tag > 0xa3))) {
                 ret MALFORMED;
             }
         }
-        if (der.next(?fields, ?current) != contracts.OK) { ret MALFORMED; }
+        if (ber.next(?fields, ?current) != contracts.OK) { ret MALFORMED; }
     }
-    if (current.tag == 0xa1 && der.next(?fields, ?current) != contracts.OK) {
+    if (current.tag == 0xa1 && ber.next(?fields, ?current) != contracts.OK) {
         ret MALFORMED;
     }
-    if (current.tag != 0x31 || !der.complete(?fields)) { ret MALFORMED; }
+    if (current.tag != 0x31 || !ber.complete(?fields)) { ret MALFORMED; }
     parsed.signer_infos = current.content;
-    var signers: der.Cursor = der.cursor(current.content);
-    for (!der.complete(?signers)) {
+    var signers: ber.Cursor = ber.cursor(current.content);
+    for (!ber.complete(?signers)) {
         var signer: der.Element;
-        if (der.next(?signers, ?signer) != contracts.OK || signer.tag != der.SEQUENCE) {
+        if (ber.next(?signers, ?signer) != contracts.OK || signer.tag != der.SEQUENCE) {
             ret MALFORMED;
         }
         parsed.signer_count = parsed.signer_count + 1;
@@ -700,6 +752,14 @@ fun attribute_parts(element: *der.Element, oid: *der.Element, values: *der.Eleme
     var body: der.Cursor = der.cursor(element.content);
     ret der.next(?body, oid) == contracts.OK && oid.tag == der.OBJECT_ID &&
         der.next(?body, values) == contracts.OK && values.tag == 0x31 && der.complete(?body);
+}
+
+fun ber_attribute_parts(element: *der.Element, oid: *der.Element,
+    values: *der.Element) bool {
+    if (element.tag != der.SEQUENCE) { ret false; }
+    var body: ber.Cursor = ber.cursor(element.content);
+    ret ber.next(?body, oid) == contracts.OK && oid.tag == der.OBJECT_ID &&
+        ber.next(?body, values) == contracts.OK && values.tag == 0x31 && ber.complete(?body);
 }
 
 fun resolve_signature_algorithm(element: *der.Element, digest: DigestAlgorithm,
@@ -731,7 +791,8 @@ fun resolve_signature_algorithm(element: *der.Element, digest: DigestAlgorithm,
 
 fun parse_signed_attributes(value: *SignedData, parsed: *SignerInfo) Error {
     var attributes: der.Element;
-    if (!one(parsed.signed_attributes, ?attributes)) { ret MALFORMED; }
+    # the signature covers these bytes as a der set, so every level is der
+    if (der.exact(parsed.signed_attributes, ?attributes) != contracts.OK) { ret MALFORMED; }
     var body:                der.Cursor = der.cursor(attributes.content);
     var saw_content_type:    bool       = false;
     var saw_message_digest:  bool       = false;
@@ -785,31 +846,31 @@ fun parse_signed_attributes(value: *SignedData, parsed: *SignerInfo) Error {
 # parse the index-th signer info of a parsed signed data
 pub fun signer_info(value: *SignedData, index: usize, output: *SignerInfo) Error {
     if (value == nil || output == nil || index >= value.signer_count) { ret INVALID_INPUT; }
-    var signers: der.Cursor = der.cursor(value.signer_infos);
+    var signers: ber.Cursor = ber.cursor(value.signer_infos);
     var element: der.Element;
     var i:       usize      = 0;
     for (i <= index) {
-        if (der.next(?signers, ?element) != contracts.OK) { ret MALFORMED; }
+        if (ber.next(?signers, ?element) != contracts.OK) { ret MALFORMED; }
         i = i + 1;
     }
     var parsed: SignerInfo;
     parsed.encoded = element.encoded;
-    var body:    der.Cursor = der.cursor(element.content);
+    var body:    ber.Cursor = ber.cursor(element.content);
     var version: der.Element;
     var sid:     der.Element;
-    if (der.next(?body, ?version) != contracts.OK || version.tag != der.INTEGER ||
-        version.content.len != 1 || der.next(?body, ?sid) != contracts.OK) {
+    if (ber.next(?body, ?version) != contracts.OK || version.tag != der.INTEGER ||
+        version.content.len != 1 || ber.next(?body, ?sid) != contracts.OK) {
         ret MALFORMED;
     }
     parsed.version = version.content.data[0];
     if (sid.tag == der.SEQUENCE && parsed.version == 1) {
-        var sid_body: der.Cursor = der.cursor(sid.content);
+        var sid_body: ber.Cursor = ber.cursor(sid.content);
         var issuer:   der.Element;
         var serial:   der.Element;
         var checked:  der.Element;
-        if (der.next(?sid_body, ?issuer) != contracts.OK || issuer.tag != der.SEQUENCE ||
+        if (ber.next(?sid_body, ?issuer) != contracts.OK || issuer.tag != der.SEQUENCE ||
             der.exact(issuer.encoded, ?checked) != contracts.OK ||
-            der.next(?sid_body, ?serial) != contracts.OK || !der.complete(?sid_body) ||
+            ber.next(?sid_body, ?serial) != contracts.OK || !ber.complete(?sid_body) ||
             der.positive_integer(?serial, ?parsed.serial) != contracts.OK) {
             ret MALFORMED;
         }
@@ -821,33 +882,34 @@ pub fun signer_info(value: *SignedData, index: usize, output: *SignerInfo) Error
     or { ret MALFORMED; }
 
     var current: der.Element;
-    if (der.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
+    if (ber.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
     parsed.digest = parse_digest_algorithm(?current);
     if (parsed.digest == DIGEST_NONE)              { ret UNSUPPORTED_ALGORITHM; }
-    if (der.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
+    if (ber.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
     if (current.tag == 0xa0) {
         parsed.signed_attributes = current.encoded;
-        if (der.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
+        if (ber.next(?body, ?current) != contracts.OK) { ret MALFORMED; }
     }
     if (current.tag != der.SEQUENCE) { ret MALFORMED; }
     if (!resolve_signature_algorithm(?current, parsed.digest, ?parsed.signature_algorithm)) {
         ret UNSUPPORTED_ALGORITHM;
     }
     var signature: der.Element;
-    if (der.next(?body, ?signature) != contracts.OK || signature.tag != der.OCTET_STRING ||
+    if (ber.next(?body, ?signature) != contracts.OK || !is_octet_string(?signature) ||
         signature.content.len == 0) { ret MALFORMED; }
-    parsed.signature = signature.content;
-    if (!der.complete(?body)) {
-        if (der.next(?body, ?current) != contracts.OK || current.tag != 0xa1 ||
-            !der.complete(?body)) { ret MALFORMED; }
-        var unsigned: der.Cursor = der.cursor(current.content);
-        if (der.complete(?unsigned)) { ret MALFORMED; }
-        for (!der.complete(?unsigned)) {
+    parsed.signature_string = signature;
+    if (signature.tag == der.OCTET_STRING) { parsed.signature = signature.content; }
+    if (!ber.complete(?body)) {
+        if (ber.next(?body, ?current) != contracts.OK || current.tag != 0xa1 ||
+            !ber.complete(?body)) { ret MALFORMED; }
+        var unsigned: ber.Cursor = ber.cursor(current.content);
+        if (ber.complete(?unsigned)) { ret MALFORMED; }
+        for (!ber.complete(?unsigned)) {
             var attribute: der.Element;
             var oid:       der.Element;
             var values:    der.Element;
-            if (der.next(?unsigned, ?attribute) != contracts.OK ||
-                !attribute_parts(?attribute, ?oid, ?values)) { ret MALFORMED; }
+            if (ber.next(?unsigned, ?attribute) != contracts.OK ||
+                !ber_attribute_parts(?attribute, ?oid, ?values)) { ret MALFORMED; }
         }
         parsed.unsigned_attributes = current.encoded;
     }
@@ -875,12 +937,12 @@ fun signer_matches(info: *SignerInfo, candidate: *x509.Certificate) bool {
 # collect the included certificates with the signer's first
 fun find_signer(value: *SignedData, info: *SignerInfo, certificates: *cert.Certificate,
     count: *usize, leaf: *x509.Certificate) Error {
-    var choices: der.Cursor = der.cursor(value.certificates);
+    var choices: ber.Cursor = ber.cursor(value.certificates);
     var found:   bool       = false;
     var total:   usize      = 0;
-    for (!der.complete(?choices)) {
+    for (!ber.complete(?choices)) {
         var choice: der.Element;
-        if (der.next(?choices, ?choice) != contracts.OK) { ret MALFORMED; }
+        if (ber.next(?choices, ?choice) != contracts.OK) { ret MALFORMED; }
         if (choice.tag != der.SEQUENCE)                  { cnt; }
         if (total == path.MAX_CHAIN_DEPTH)               { ret RESOURCE_LIMIT; }
         certificates[total] = cert.Certificate{der: choice.encoded.data,
@@ -962,6 +1024,9 @@ fun verify_signer(value: *SignedData, index: usize, options: *VerifyOptions,
 
     var content:      contracts.Bytes = value.content;
     var have_content: bool            = value.content_present;
+    # content built from segments is digested in place, never joined
+    val segmented: bool = value.content_present &&
+        value.content_string.tag == CONSTRUCTED_OCTET_STRING;
     if (value.content_present) {
         if (options.form != ATTACHED) { ret judged(INVALID_INPUT); }
     }
@@ -983,8 +1048,19 @@ fun verify_signer(value: *SignedData, index: usize, options: *VerifyOptions,
         var computed: [MAX_DIGEST_SIZE]u8;
         var digest:   contracts.Bytes = options.content_digest;
         if (have_content) {
-            if (!digest_of(info.digest, content, ?computed[0])) { ret judged(INVALID_INPUT); }
-            digest = contracts.Bytes{data: ?computed[0], len: digest_size(info.digest)};
+            var state: Digest;
+            if (digest_init(?state, info.digest) != contracts.OK) { ret judged(INVALID_INPUT); }
+            if (segmented) {
+                var unused: usize = 0;
+                val joined: Error = string_octets(?value.content_string, 0, ?state, nil, 0,
+                    ?unused);
+                if (joined != OK) { ret judged(joined); }
+            }
+            or (digest_update(?state, content) != contracts.OK) { ret judged(INVALID_INPUT); }
+            val done: contracts.Operation = digest_final(?state,
+                contracts.Buffer{data: ?computed[0], capacity: MAX_DIGEST_SIZE});
+            if (done.error != contracts.OK) { ret judged(INVALID_INPUT); }
+            digest = contracts.Bytes{data: ?computed[0], len: done.written};
         }
         or (digest.len != digest_size(info.digest) || digest.data == nil) {
             ret judged(INVALID_INPUT);
@@ -1000,9 +1076,21 @@ fun verify_signer(value: *SignedData, index: usize, options: *VerifyOptions,
         signed     = contracts.Bytes{data: ?message[0], len: info.signed_attributes.len};
     }
     or (!have_content) { ret judged(INVALID_INPUT); }
+    # a signature over the content itself needs the content joined
+    if (segmented && info.signed_attributes.len == 0) { ret judged(RESOURCE_LIMIT); }
 
+    var gathered:  [MAX_SIGNATURE_SIZE]u8;
+    var signature: contracts.Bytes = info.signature;
+    if (info.signature_string.tag == CONSTRUCTED_OCTET_STRING) {
+        var joined: usize = 0;
+        val status: Error = string_octets(?info.signature_string, 0, nil, ?gathered[0],
+            MAX_SIGNATURE_SIZE, ?joined);
+        if (status != OK) { ret judged(status); }
+        if (joined == 0)  { ret judged(MALFORMED); }
+        signature = contracts.Bytes{data: ?gathered[0], len: joined};
+    }
     val checked: path.Error = path.message(?leaf.public_key, info.signature_algorithm,
-        signed, info.signature);
+        signed, signature);
     if (checked == path.UNSUPPORTED_ALGORITHM) { ret judged(UNSUPPORTED_ALGORITHM); }
     if (checked != path.OK)                    { ret judged(BAD_SIGNATURE); }
     if (info.signing_certificate.len > 0) {
@@ -1014,6 +1102,14 @@ fun verify_signer(value: *SignedData, index: usize, options: *VerifyOptions,
     if (trusted != path.OK) { ret Verdict{error: UNTRUSTED, chain: trusted}; }
     if (output != nil)      { @output = info; }
     ret judged(OK);
+}
+
+# the length of the ber or der element that starts input, 0 when none does. a
+# caller that finds signed data followed by padding, as in a pdf signature's
+# reserved space, reads where it ends with this
+pub fun encoded_length(input: contracts.Bytes) usize {
+    if (!valid_bytes(input)) { ret 0; }
+    ret ber.length(input);
 }
 
 # verify every signer of a signed data
@@ -1515,5 +1611,110 @@ test cms__unsigned_attributes_attach_after_signing {
     var malformed: [3]u8 = [3]u8{0x30, 0x01, 0x05};
     if (attach_unsigned(signed, contracts.Bytes{data: ?malformed[0], len: 3},
         contracts.Buffer{data: ?once[0], capacity: 2048}).error != INVALID_INPUT) { ret 7; }
+    ret 0;
+}
+
+# genuine okular signatures from a p-384 yubikey with sha-256, whose signed data
+# nss wrote in ber with indefinite lengths. the digests are of their pdf byte
+# ranges, and the root is briar's, from http://pki.briar.systems/root.pem
+#[testing]
+#[embed("../test/vectors/cms/okular-root.der")]
+val OKULAR_ROOT:     [542]u8;
+#[testing]
+#[embed("../test/vectors/cms/okular-p384-sha256-1.cms")]
+val OKULAR_1:        [2069]u8;
+#[testing]
+#[embed("../test/vectors/cms/okular-p384-sha256-1.digest")]
+val OKULAR_1_DIGEST: [32]u8;
+#[testing]
+#[embed("../test/vectors/cms/okular-p384-sha256-2.cms")]
+val OKULAR_2:        [2071]u8;
+#[testing]
+#[embed("../test/vectors/cms/okular-p384-sha256-2.digest")]
+val OKULAR_2_DIGEST: [32]u8;
+# the first with its first signed attribute in an indefinite length, so the
+# attributes the signature covers are not der. from test/interop/generate-ber.py
+#[testing]
+#[embed("../test/vectors/cms/ber-okular-attributes.cms")]
+val BER_ATTRIBUTES: [2069]u8;
+# openssl-p256-attached.der with every length of the envelope indefinite and
+# the content and signature built from two segments each
+#[testing]
+#[embed("../test/vectors/cms/ber-openssl-p256-attached.der")]
+val BER_P256_ATTACHED: [1038]u8;
+
+#[testing]
+fun okular_verdict(signed: *u8, signed_len: usize, digest: *u8, info: *SignerInfo) Error {
+    var trust:   Trust;
+    var options: VerifyOptions = verify_options(?trust, DETACHED_DIGEST);
+    trust.anchor           = cert.Certificate{der: ?OKULAR_ROOT[0], der_len: 542};
+    options.content_digest = contracts.Bytes{data: digest, len: 32};
+    ret verify(contracts.Bytes{data: signed, len: signed_len}, ?options, info).error;
+}
+
+test cms__verifies_ber_with_indefinite_lengths {
+    var info: SignerInfo;
+    if (okular_verdict(?OKULAR_1[0], 2069, ?OKULAR_1_DIGEST[0], ?info) != OK ||
+        info.signature_algorithm != x509.ECDSA_SHA256 || info.digest != SHA256) { ret 1; }
+    if (okular_verdict(?OKULAR_2[0], 2071, ?OKULAR_2_DIGEST[0], nil) != OK) { ret 2; }
+    # a signature belongs to the content it signed
+    if (okular_verdict(?OKULAR_1[0], 2069, ?OKULAR_2_DIGEST[0], nil) != CONTENT_MISMATCH) {
+        ret 3;
+    }
+    # signed data and its signature built from segments, attached
+    var trust:   Trust;
+    var options: VerifyOptions = verify_options(?trust, ATTACHED);
+    if (verify(contracts.Bytes{data: ?BER_P256_ATTACHED[0], len: 1038}, ?options,
+        nil).error != OK) { ret 4; }
+    # a changed segment fails the signature, a changed signature segment too
+    var changed: [1038]u8 = BER_P256_ATTACHED;
+    changed[54] = changed[54] ^ 1;
+    if (verify(contracts.Bytes{data: ?changed[0], len: 1038}, ?options, nil).error !=
+        CONTENT_MISMATCH) { ret 5; }
+    changed       = BER_P256_ATTACHED;
+    changed[1000] = changed[1000] ^ 1;
+    if (verify(contracts.Bytes{data: ?changed[0], len: 1038}, ?options, nil).error !=
+        BAD_SIGNATURE) { ret 6; }
+    ret 0;
+}
+
+test cms__refuses_signed_attributes_that_are_not_der {
+    if (okular_verdict(?BER_ATTRIBUTES[0], 2069, ?OKULAR_1_DIGEST[0], nil) != MALFORMED) {
+        ret 1;
+    }
+    ret 0;
+}
+
+test cms__bounds_what_it_reads_of_ber {
+    var trust:   Trust;
+    var options: VerifyOptions = verify_options(?trust, DETACHED_DIGEST);
+    var value:   SignedData;
+    # the end of the contents is missing, or a byte short of it
+    var i: usize = 0;
+    for (i < 2069) {
+        if (parse(contracts.Bytes{data: ?OKULAR_1[0], len: i}, ?value) == OK) { ret 1; }
+        i = i + 7;
+    }
+    # indefinite lengths that nest past the bound, and one that never ends
+    var deep: [200]u8;
+    i = 0;
+    for (i < 2 * 70) {
+        deep[i]     = 0x30;
+        deep[i + 1] = 0x80;
+        i           = i + 2;
+    }
+    if (parse(contracts.Bytes{data: ?deep[0], len: 200}, ?value) != MALFORMED) { ret 2; }
+    # an indefinite length on a primitive
+    var primitive: [4]u8 = [4]u8{0x04, 0x80, 0x00, 0x00};
+    if (encoded_length(contracts.Bytes{data: ?primitive[0], len: 4}) != 0) { ret 3; }
+    # the length of an element is where it ends, whatever follows
+    var padded: [2100]u8;
+    i = 0;
+    for (i < 2100) {
+        padded[i] = 0;
+        if (i < 2069) { padded[i] = OKULAR_1[i]; }
+        i = i + 1;
+    }
+    if (encoded_length(contracts.Bytes{data: ?padded[0], len: 2100}) != 2069) { ret 4; }
     ret 0;
 }
