@@ -1716,5 +1716,11 @@ test cms__bounds_what_it_reads_of_ber {
         i = i + 1;
     }
     if (encoded_length(contracts.Bytes{data: ?padded[0], len: 2100}) != 2069) { ret 4; }
+    # attaching rewrites der, so ber it cannot carry over is refused
+    var attached:  [2048]u8;
+    val rewritten: Result = attach_unsigned(contracts.Bytes{data: ?BER_P256_ATTACHED[0], len: 1038},
+        contracts.Bytes{data: ?TEST_ATTRIBUTE[0], len: 11},
+        contracts.Buffer{data: ?attached[0], capacity: 2048});
+    if (rewritten.error == OK) { ret 5; }
     ret 0;
 }
