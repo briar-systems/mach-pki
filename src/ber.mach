@@ -1,0 +1,112 @@
+# bounded basic encoding rules for the cms envelope (rfc 5652 1.3)
+#
+# a signed data may arrive in ber: lengths that are indefinite, lengths that
+# are not minimal, and octet strings built from segments. this walks that
+# shape and publishes each element as a der.Element, so the strict der code
+# that handles what a signature covers reads the same type. it checks structure
+# only. nothing here makes bytes der, so a caller that hashes or trusts an
+# element's contents as der reads them with crypto.encoding.der.
+#
+# every read is checked against the input first. indefinite lengths nest to
+# MAX_DEPTH, and a definite element's contents are not looked into until the
+# caller walks them.
+
+use crypto.contracts;
+use crypto.encoding.der;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# levels of indefinite-length elements below the one asked for
+pub val MAX_DEPTH: usize = 32;
+
+pub rec Cursor {
+    input:  contracts.Bytes;
+    offset: usize;
+}
+
+pub fun cursor(input: contracts.Bytes) Cursor {
+    ret Cursor{input: input, offset: 0};
+}
+
+pub fun complete(value: *Cursor) bool {
+    ret value != nil && value.offset == value.input.len;
+}
+
+# whether a constructed element's tag marks it as one the tag byte can hold
+fun constructed(tag: der.Tag) bool {
+    ret (tag & 0x20) != 0;
+}
+
+# read the element at the start of data. the end of contents octets of an
+# indefinite length belong to its element, and are not part of its content
+fun read(data: *u8, len: usize, depth: usize, output: *der.Element) bool {
+    if (depth > MAX_DEPTH || data == nil || len < 2) { ret false; }
+    val tag: der.Tag = data[0];
+    # zero is the end of contents marker, not an element, and 0x1f starts a
+    # multi-byte tag number, which nothing here uses
+    if (tag == 0 || (tag & 0x1f) == 0x1f) { ret false; }
+    val first:   u8    = data[1];
+    var header:  usize = 2;
+    var content: usize = 0;
+    var trailer: usize = 0;
+    if (first < 0x80) {
+        content = first::usize;
+    }
+    or (first == 0x80) {
+        if (!constructed(tag)) { ret false; }
+        var at: usize = 2;
+        for (true) {
+            # a marker needs both bytes, and so does any element
+            if (len - at < 2)                       { ret false; }
+            if (data[at] == 0 && data[at + 1] == 0) { brk; }
+            var child: der.Element;
+            if (!read(?data[at], len - at, depth + 1, ?child)) { ret false; }
+            at = at + child.encoded.len;
+        }
+        content = at - 2;
+        trailer = 2;
+    }
+    or {
+        val count: usize = (first & 0x7f)::usize;
+        if (count > 8 || count > len - 2) { ret false; }
+        var i: usize = 0;
+        for (i < count) {
+            val value: usize = data[2 + i]::usize;
+            if (content > ((0 - 1) - value) >> 8) { ret false; }
+            content = (content << 8) | value;
+            i       = i + 1;
+        }
+        header = 2 + count;
+    }
+    if (content > len - header || trailer > len - header - content) { ret false; }
+    var start: *u8 = nil;
+    if (content > 0) { start = ?data[header]; }
+    output.tag     = tag;
+    output.content = contracts.Bytes{data: start, len: content};
+    output.encoded = contracts.Bytes{data: data, len: header + content + trailer};
+    ret true;
+}
+
+# read the next element
+pub fun next(value: *Cursor, output: *der.Element) contracts.Error {
+    if (value == nil || output == nil || value.offset >= value.input.len ||
+        value.input.data == nil) { ret contracts.INVALID_INPUT; }
+    var parsed: der.Element;
+    if (!read(?value.input.data[value.offset], value.input.len - value.offset, 0,
+        ?parsed)) { ret contracts.INVALID_INPUT; }
+    value.offset = value.offset + parsed.encoded.len;
+    @output      = parsed;
+    ret contracts.OK;
+}
+
+# the length of the element that starts input, 0 when none does. a caller that
+# holds an element followed by padding, such as a signature's reserved space in
+# a pdf, uses this to find where it ends
+pub fun length(input: contracts.Bytes) usize {
+    var value:  Cursor = cursor(input);
+    var parsed: der.Element;
+    if (next(?value, ?parsed) != contracts.OK) { ret 0; }
+    ret parsed.encoded.len;
+}

@@ -114,8 +114,11 @@ A `verify.Purpose` says what the leaf is accepted for: the key usage bits a leaf
 with a key usage extension must assert one of, and the extended key usage that
 the leaf and every intermediate carrying that extension must list, unless it
 lists any purpose. The constructors are `server_auth`, `client_auth`,
-`code_signing`, `email_protection`, `time_stamping`, and `document_signing`
-(RFC 9336). A caller builds its own for any other purpose.
+`code_signing`, `email_protection`, `time_stamping`, and `document_signing`.
+`document_signing` accepts what PDF validators accept: RFC 9336 document
+signing, `emailProtection`, Adobe Authentic Documents, or Microsoft document
+signing, besides no extended key usage or any purpose. A purpose lists such
+alternatives in `alternatives`. A caller builds its own for any other purpose.
 
 Intermediates must carry a critical CA basic constraint and, when key usage is
 present, `keyCertSign`. Path length excludes the leaf and self-issued rollover
@@ -239,6 +242,15 @@ accepts the signer identified by issuer and serial number or by subject key
 identifier, and RSA PKCS #1 v1.5 named by `rsaEncryption`. `cms.parse` and
 `cms.signer_info` read signed data without verifying it, for a caller that
 needs the digest algorithm before it hashes detached content.
+
+Signed data may be BER, as NSS (Okular, poppler), Acrobat and other pdf tools
+write it: indefinite lengths and octet strings built from segments are read in
+the envelope. What a signature covers stays strict DER: the signed attributes,
+the signer's issuer name and the certificates are refused otherwise. Nesting is
+bounded and every read is checked against the input. `cms.encoded_length` gives
+the length of the BER or DER element at the start of a buffer, for signed data
+followed by padding. `cms.attach_unsigned` rewrites DER signed data and refuses
+BER it cannot.
 
 ```mach
 use crypto.contracts;
