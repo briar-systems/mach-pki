@@ -1,0 +1,194 @@
+# sequential der writer over der.write, with a measuring mode
+#
+# elements are appended in order and a constructed element is closed around
+# everything appended since it was opened, in place. a measuring writer
+# stores nothing and only counts, so a caller can size its output before it
+# commits to work that cannot be repeated, such as a signature. the first
+# failure sticks and every later call is inert.
+
+use crypto.contracts;
+use crypto.encoding.der;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub rec Writer {
+    data:     *u8;
+    capacity: usize;
+    len:      usize;
+    measure:  bool;
+    error:    contracts.Error;
+}
+
+# a writer into output
+pub fun into(output: contracts.Buffer) Writer {
+    var error: contracts.Error = contracts.OK;
+    if (output.capacity > 0 && output.data == nil) { error = contracts.INVALID_INPUT; }
+    ret Writer{
+        data:     output.data,
+        capacity: output.capacity,
+        len:      0,
+        measure:  false,
+        error:    error,
+    };
+}
+
+# a writer that only measures
+pub fun measuring() Writer {
+    ret Writer{data: nil, capacity: 0, len: 0, measure: true, error: contracts.OK};
+}
+
+fun grow(value: *Writer, size: usize) bool {
+    if (size > (0 - 1) - value.len) {
+        value.error = contracts.INVALID_INPUT;
+        ret false;
+    }
+    if (value.measure) {
+        value.len = value.len + size;
+        ret false;
+    }
+    if (size > value.capacity - value.len) {
+        value.error = contracts.OUTPUT_TOO_SMALL;
+        ret false;
+    }
+    ret true;
+}
+
+# append one element with the tag around content
+pub fun element(value: *Writer, tag: der.Tag, content: contracts.Bytes) {
+    if (value.error != contracts.OK) { ret; }
+    val size: usize = der.encoded_len(content.len);
+    if (size == 0) {
+        value.error = contracts.INVALID_INPUT;
+        ret;
+    }
+    if (!grow(value, size)) { ret; }
+    val made: contracts.Operation = der.write(tag, content,
+        contracts.Buffer{data: ?value.data[value.len], capacity: value.capacity - value.len});
+    if (made.error != contracts.OK) {
+        value.error = made.error;
+        ret;
+    }
+    value.len = value.len + made.written;
+}
+
+# append bytes that are already encoded
+pub fun raw(value: *Writer, encoded: contracts.Bytes) {
+    if (value.error != contracts.OK) { ret; }
+    if (encoded.len > 0 && encoded.data == nil) {
+        value.error = contracts.INVALID_INPUT;
+        ret;
+    }
+    if (!grow(value, encoded.len)) { ret; }
+    if (encoded.len > 0) {
+        memory.copy[u8](?value.data[value.len], encoded.data, encoded.len);
+    }
+    value.len = value.len + encoded.len;
+}
+
+# open a constructed element, closed by close with the same mark
+pub fun open(value: *Writer) usize {
+    ret value.len;
+}
+
+# close the constructed element opened at mark with the tag
+pub fun close(value: *Writer, mark: usize, tag: der.Tag) {
+    if (value.error != contracts.OK) { ret; }
+    if (mark > value.len) {
+        value.error = contracts.INVALID_INPUT;
+        ret;
+    }
+    val content_len: usize = value.len - mark;
+    val size:        usize = der.encoded_len(content_len);
+    if (size == 0) {
+        value.error = contracts.INVALID_INPUT;
+        ret;
+    }
+    if (value.measure) {
+        value.len = mark + size;
+        ret;
+    }
+    if (size - content_len > value.capacity - value.len) {
+        value.error = contracts.OUTPUT_TOO_SMALL;
+        ret;
+    }
+    val made: contracts.Operation = der.write(tag,
+        contracts.Bytes{data: ?value.data[mark], len: content_len},
+        contracts.Buffer{data: ?value.data[mark], capacity: value.capacity - mark});
+    if (made.error != contracts.OK) {
+        value.error = made.error;
+        ret;
+    }
+    value.len = mark + made.written;
+}
+
+# report whether first sorts before second in a der set of: compared as octet
+# strings with the shorter padded with trailing zero octets
+pub fun before(first: contracts.Bytes, second: contracts.Bytes) bool {
+    var i: usize = 0;
+    for (i < first.len || i < second.len) {
+        var a: u8 = 0;
+        var b: u8 = 0;
+        if (i < first.len)  { a = first.data[i]; }
+        if (i < second.len) { b = second.data[i]; }
+        if (a != b)         { ret a < b; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# sort encoded elements into der set of order
+pub fun sort(elements: *contracts.Bytes, count: usize) {
+    var i: usize = 1;
+    for (i < count) {
+        val current: contracts.Bytes = elements[i];
+        var j:       usize           = i;
+        for (j > 0 && before(current, elements[j - 1])) {
+            elements[j] = elements[j - 1];
+            j           = j - 1;
+        }
+        elements[j] = current;
+        i           = i + 1;
+    }
+}
+
+# the result of every write so far
+pub fun result(value: *Writer) contracts.Operation {
+    if (value.error != contracts.OK) {
+        ret contracts.Operation{error: value.error, written: 0};
+    }
+    ret contracts.Operation{error: contracts.OK, written: value.len};
+}
+
+test writer__measures_what_it_writes_and_sorts_sets {
+    var first:  [3]u8              = [3]u8{0x02, 0x01, 0x05};
+    var second: [2]u8              = [2]u8{0x05, 0x00};
+    var parts:  [2]contracts.Bytes = [2]contracts.Bytes{
+        contracts.Bytes{data: ?first[0], len: 3},
+        contracts.Bytes{data: ?second[0], len: 2},
+    };
+    var output: [8]u8;
+    var real:   Writer = into(contracts.Buffer{data: ?output[0], capacity: 8});
+    var count:  Writer = measuring();
+    sort(?parts[0], 2);
+    if (parts[0].data != ?first[0]) { ret 1; }
+    var mark: usize = open(?real);
+    raw(?real, parts[1]);
+    raw(?real, parts[0]);
+    close(?real, mark, 0x31);
+    mark = open(?count);
+    raw(?count, parts[1]);
+    raw(?count, parts[0]);
+    close(?count, mark, 0x31);
+    val made: contracts.Operation = result(?real);
+    if (made.error != contracts.OK || made.written != 7 || result(?count).written != 7 ||
+        output[0] != 0x31 || output[1] != 5 || output[2] != 0x05 || output[6] != 0x05) {
+        ret 2;
+    }
+    var short: Writer = into(contracts.Buffer{data: ?output[0], capacity: 3});
+    element(?short, der.OCTET_STRING, parts[0]);
+    if (result(?short).error != contracts.OUTPUT_TOO_SMALL) { ret 3; }
+    ret 0;
+}

@@ -1,7 +1,7 @@
 # mach-pki
 
-X.509 certificates for Mach: strict parsing, loading, and certification path
-validation. Parsing and validation borrow their input and allocate nothing. TLS, CMS and PDF signing share this one
+X.509 certificates and CMS signed data for Mach: strict parsing, loading,
+certification path validation, signing, and signature verification. Parsing and validation borrow their input and allocate nothing. TLS, CMS and PDF signing share this one
 certificate model. It depends on mach-std and mach-crypto only.
 
 ## Modules
@@ -21,6 +21,8 @@ certificate model. It depends on mach-std and mach-crypto only.
 - `pki.signer` is the signing contract: a key that never leaves its signer,
   whether in memory, on a token, in an HSM or behind a remote service.
 - `pki.key_signer` signs with a private key held in memory and its PEM chain.
+- `pki.cms` builds CMS signed data through a signer, and parses and verifies
+  it.
 
 `use pki;` binds `pki.lib.pki`, which re-exports these modules.
 
@@ -199,11 +201,71 @@ val made: signer.Result = signer.sign(?value, x509.ED25519, tbs,
 key_signer.close(?keyed);
 ```
 
+## CMS signed data
+
+`cms.build` signs content through a `signer.Signer` into RFC 5652 signed data,
+with the content encapsulated (`ATTACHED`), left with the caller (`DETACHED`),
+or given only as its digest (`DETACHED_DIGEST`), such as a PDF byte range
+hashed with `cms.digest_init`, `digest_update` and `digest_final`. The signed
+attributes are content-type, message-digest, ESS signing-certificate-v2 (RFC
+5035) naming the leaf by its SHA-256 hash, and signing-time when the caller
+supplies one. Nothing reads a clock. The signer's chain is included and the
+leaf is identified by issuer and serial number. The same inputs always encode
+the same bytes, so a signer with a deterministic algorithm makes reproducible
+signed data.
+
+The algorithm is the one the caller names or the signer's first, and the digest
+algorithm follows it (`cms.digest_algorithm`): the algorithm's own hash, and
+SHA-512 for Ed25519, which signs the signed attributes directly (RFC 8419).
+RSA-PSS carries its RSASSA-PSS parameters. The encodings for ECDSA P-384 and
+RSA PKCS #1 v1.5 are in place for signers that offer them. `cms.build` measures
+its output before the signer is asked, so a short output reports the size
+needed and never spends a signature.
+
+`cms.attach_unsigned` adds unsigned attributes to the sole signer after
+signing, such as an RFC 3161 time-stamp token over its signature, without
+touching a signed byte.
+
+`cms.verify` checks every signer: its certificate among the included ones, its
+signature with `verify.message`, its message digest against the content or the
+caller's digest, its signing-certificate-v2 attribute when present, and its
+path with `verify.chain` against the caller's trust store and options. It
+accepts the signer identified by issuer and serial number or by subject key
+identifier, and RSA PKCS #1 v1.5 named by `rsaEncryption`. `cms.parse` and
+`cms.signer_info` read signed data without verifying it, for a caller that
+needs the digest algorithm before it hashes detached content.
+
+```mach
+use crypto.contracts;
+use pki.cms;
+use pki.signer;
+use std.types.bool.true;
+
+# value is an open signer.Signer, content the bytes to sign and at the
+# signing time
+var options: cms.Options;
+options.form                 = cms.DETACHED;
+options.content              = content;
+options.signing_time_present = true;
+options.signing_time         = at;
+var output: [16384]u8;
+val built:  cms.Result = cms.build(?value, ?options,
+    contracts.Buffer{data: ?output[0], capacity: 16384});
+```
+
 ## Fuzzing
 
 `test/fuzz` replays retained inputs against the parser and searches for new
 ones. It runs locally, and [`test/fuzz/README.md`](test/fuzz/README.md) has the
 commands.
+
+## Interop
+
+`test/interop/run.sh` checks CMS against OpenSSL in both directions with fresh
+keys: OpenSSL verifies what `cms.build` makes for every algorithm, attached and
+detached, and `cms.verify` checks what `openssl cms -sign` makes. It runs
+locally. The unit tests replay vectors from `test/interop/generate.sh`, kept in
+`test/vectors/cms`.
 
 ## Build
 
