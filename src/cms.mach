@@ -191,9 +191,6 @@ val ATTRIBUTE_SIGNING_TIME: [9]u8 = [9]u8{
 val ATTRIBUTE_SIGNING_CERTIFICATE_V2: [11]u8 = [11]u8{
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x02, 0x2f,
 };
-val OID_SHA512: [9]u8 = [9]u8{
-    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
-};
 val OID_RSA_ENCRYPTION: [9]u8 = [9]u8{
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
 };
@@ -249,24 +246,26 @@ fun parse_digest_algorithm(element: *der.Element) DigestAlgorithm {
         !null_or_absent(?body)) { ret DIGEST_NONE; }
     if (oid_is(oid.content, ?x509.OID_SHA256[0], 9)) { ret SHA256; }
     if (oid_is(oid.content, ?x509.OID_SHA384[0], 9)) { ret SHA384; }
-    if (oid_is(oid.content, ?OID_SHA512[0], 9))      { ret SHA512; }
+    if (oid_is(oid.content, ?x509.OID_SHA512[0], 9)) { ret SHA512; }
     ret DIGEST_NONE;
 }
 
 fun digest_oid(algorithm: DigestAlgorithm) *u8 {
     if (algorithm == SHA256) { ret ?x509.OID_SHA256[0]; }
     if (algorithm == SHA384) { ret ?x509.OID_SHA384[0]; }
-    ret ?OID_SHA512[0];
+    ret ?x509.OID_SHA512[0];
 }
 
 # the digest algorithm a signature algorithm pairs with: its own hash, and
 # sha-512 for ed25519 (rfc 8419)
 pub fun digest_algorithm(algorithm: x509.SignatureAlgorithm) DigestAlgorithm {
     if (algorithm == x509.ED25519) { ret SHA512; }
-    if (algorithm == x509.ECDSA_P256_SHA256 || algorithm == x509.RSA_PSS_SHA256 ||
+    if (algorithm == x509.ECDSA_SHA256 || algorithm == x509.RSA_PSS_SHA256 ||
         algorithm == x509.RSA_PKCS1_SHA256) { ret SHA256; }
-    if (algorithm == x509.ECDSA_P384_SHA384 || algorithm == x509.RSA_PSS_SHA384 ||
+    if (algorithm == x509.ECDSA_SHA384 || algorithm == x509.RSA_PSS_SHA384 ||
         algorithm == x509.RSA_PKCS1_SHA384) { ret SHA384; }
+    if (algorithm == x509.ECDSA_SHA512 || algorithm == x509.RSA_PSS_SHA512 ||
+        algorithm == x509.RSA_PKCS1_SHA512) { ret SHA512; }
     ret DIGEST_NONE;
 }
 
@@ -721,6 +720,10 @@ fun resolve_signature_algorithm(element: *der.Element, digest: DigestAlgorithm,
     }
     if (digest == SHA384) {
         @output = x509.RSA_PKCS1_SHA384;
+        ret true;
+    }
+    if (digest == SHA512) {
+        @output = x509.RSA_PKCS1_SHA512;
         ret true;
     }
     ret false;
@@ -1314,12 +1317,12 @@ test cms__builds_and_verifies_every_algorithm_the_signer_offers {
     if (!open_fixture(?ed25519, ?ED25519_KEY[0], 119, ?ED25519_CHAIN[0], 1397) ||
         !open_fixture(?p256, ?P256_KEY[0], 241, ?P256_CHAIN[0], 1462) ||
         !open_fixture(?rsa, ?RSA_KEY[0], 1704, ?RSA_CHAIN[0], 1734)) { ret 1; }
-    if (every_form(?ed25519.signer, x509.ED25519) != 0)        { ret 2; }
-    if (every_form(?p256.signer, x509.ECDSA_P256_SHA256) != 0) { ret 3; }
-    if (every_form(?rsa.signer, x509.RSA_PSS_SHA256) != 0)     { ret 4; }
-    if (every_form(?rsa.signer, x509.RSA_PSS_SHA384) != 0)     { ret 5; }
+    if (every_form(?ed25519.signer, x509.ED25519) != 0)    { ret 2; }
+    if (every_form(?p256.signer, x509.ECDSA_SHA256) != 0)  { ret 3; }
+    if (every_form(?rsa.signer, x509.RSA_PSS_SHA256) != 0) { ret 4; }
+    if (every_form(?rsa.signer, x509.RSA_PSS_SHA384) != 0) { ret 5; }
 
-    var options: Options = signing_options(x509.ECDSA_P256_SHA256, ATTACHED);
+    var options: Options = signing_options(x509.ECDSA_SHA256, ATTACHED);
     var output:  [8192]u8;
     if (build(?ed25519.signer, ?options,
         contracts.Buffer{data: ?output[0], capacity: 8192}).error != UNSUPPORTED_ALGORITHM) {
@@ -1363,7 +1366,7 @@ test cms__the_same_inputs_build_the_bytes_openssl_verified {
     if (!builds_exactly(?ed25519, x509.ED25519, ATTACHED, ?MACH_ED25519_ATTACHED[0], 1418)) {
         ret 2;
     }
-    if (!builds_exactly(?p256, x509.ECDSA_P256_SHA256, DETACHED, ?MACH_P256_DETACHED[0], 1419)) {
+    if (!builds_exactly(?p256, x509.ECDSA_SHA256, DETACHED, ?MACH_P256_DETACHED[0], 1419)) {
         ret 3;
     }
     key_signer.close(?ed25519.keyed);
@@ -1390,7 +1393,7 @@ test cms__verifies_what_openssl_signs {
         info.signature_algorithm != x509.ED25519 || info.digest != SHA512 ||
         info.signing_certificate.len == 0 || !info.signing_time_present) { ret 1; }
     if (openssl_verdict(?OPENSSL_P256_ATTACHED[0], 1022, ATTACHED, none, ?info) != OK ||
-        info.signature_algorithm != x509.ECDSA_P256_SHA256) { ret 2; }
+        info.signature_algorithm != x509.ECDSA_SHA256) { ret 2; }
     # rsaEncryption names pkcs #1 v1.5 with the digest algorithm's hash
     if (openssl_verdict(?OPENSSL_RSA_PKCS1_DETACHED[0], 1387, DETACHED, content, ?info) != OK ||
         info.signature_algorithm != x509.RSA_PKCS1_SHA256) { ret 3; }
@@ -1414,6 +1417,56 @@ test cms__verifies_what_openssl_signs {
     val early: Verdict = verify(contracts.Bytes{data: ?OPENSSL_P256_ATTACHED[0], len: 1022},
         ?options, nil);
     if (early.error != UNTRUSTED || early.chain != path.CERTIFICATE_EXPIRED) { ret 8; }
+    ret 0;
+}
+
+# digest and curve pairings openssl signs, from test/interop/generate-digests.sh
+#[testing]
+#[embed("../test/vectors/digests/p384-root.der")]
+val P384_ROOT:                [551]u8;
+#[testing]
+#[embed("../test/vectors/digests/p521-root.der")]
+val P521_ROOT:                [626]u8;
+#[testing]
+#[embed("../test/vectors/digests/rsa-root.der")]
+val RSA512_ROOT:              [885]u8;
+#[testing]
+#[embed("../test/vectors/digests/openssl-p384-sha256-attached.der")]
+val OPENSSL_P384_SHA256:      [1111]u8;
+#[testing]
+#[embed("../test/vectors/digests/openssl-p521-sha512-attached.der")]
+val OPENSSL_P521_SHA512:      [1256]u8;
+#[testing]
+#[embed("../test/vectors/digests/openssl-rsa-pkcs1-sha512-attached.der")]
+val OPENSSL_RSA_PKCS1_SHA512: [1634]u8;
+#[testing]
+#[embed("../test/vectors/digests/openssl-rsa-pss-sha512-attached.der")]
+val OPENSSL_RSA_PSS_SHA512:   [1794]u8;
+
+#[testing]
+fun digest_verdict(signed: *u8, signed_len: usize, root: *u8, root_len: usize,
+    info: *SignerInfo) Error {
+    var trust:   Trust;
+    var options: VerifyOptions = verify_options(?trust, ATTACHED);
+    trust.anchor = cert.Certificate{der: root, der_len: root_len};
+    ret verify(contracts.Bytes{data: signed, len: signed_len}, ?options, info).error;
+}
+
+test cms__verifies_digests_that_differ_from_the_curve {
+    var info: SignerInfo;
+    # p-384 with sha-256, as poppler and acrobat sign with a yubikey
+    if (digest_verdict(?OPENSSL_P384_SHA256[0], 1111, ?P384_ROOT[0], 551, ?info) != OK ||
+        info.signature_algorithm != x509.ECDSA_SHA256 || info.digest != SHA256) { ret 1; }
+    if (digest_verdict(?OPENSSL_P521_SHA512[0], 1256, ?P521_ROOT[0], 626, ?info) != OK ||
+        info.signature_algorithm != x509.ECDSA_SHA512 || info.digest != SHA512) { ret 2; }
+    if (digest_verdict(?OPENSSL_RSA_PKCS1_SHA512[0], 1634, ?RSA512_ROOT[0], 885, ?info) != OK ||
+        info.signature_algorithm != x509.RSA_PKCS1_SHA512 || info.digest != SHA512) { ret 3; }
+    if (digest_verdict(?OPENSSL_RSA_PSS_SHA512[0], 1794, ?RSA512_ROOT[0], 885, ?info) != OK ||
+        info.signature_algorithm != x509.RSA_PSS_SHA512 || info.digest != SHA512) { ret 4; }
+    # a root of another curve does not vouch for the signer
+    if (digest_verdict(?OPENSSL_P384_SHA256[0], 1111, ?P521_ROOT[0], 626, nil) != UNTRUSTED) {
+        ret 5;
+    }
     ret 0;
 }
 

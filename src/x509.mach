@@ -21,14 +21,26 @@ pub val MAX_RDN_ATTRIBUTES: usize = 16;
 
 pub def SignatureAlgorithm: u8;
 
-pub val SIGNATURE_NONE:    SignatureAlgorithm = 0;
-pub val ECDSA_P256_SHA256: SignatureAlgorithm = 1;
-pub val ED25519:           SignatureAlgorithm = 2;
-pub val RSA_PSS_SHA256:    SignatureAlgorithm = 3;
-pub val RSA_PSS_SHA384:    SignatureAlgorithm = 4;
-pub val RSA_PKCS1_SHA256:  SignatureAlgorithm = 5;
-pub val RSA_PKCS1_SHA384:  SignatureAlgorithm = 6;
-pub val ECDSA_P384_SHA384: SignatureAlgorithm = 7;
+pub val SIGNATURE_NONE: SignatureAlgorithm = 0;
+# ecdsa names only its digest: the curve is the signer's key's
+pub val ECDSA_SHA256:     SignatureAlgorithm = 1;
+pub val ED25519:          SignatureAlgorithm = 2;
+pub val RSA_PSS_SHA256:   SignatureAlgorithm = 3;
+pub val RSA_PSS_SHA384:   SignatureAlgorithm = 4;
+pub val RSA_PKCS1_SHA256: SignatureAlgorithm = 5;
+pub val RSA_PKCS1_SHA384: SignatureAlgorithm = 6;
+pub val ECDSA_SHA384:     SignatureAlgorithm = 7;
+pub val ECDSA_SHA512:     SignatureAlgorithm = 8;
+pub val RSA_PSS_SHA512:   SignatureAlgorithm = 9;
+pub val RSA_PKCS1_SHA512: SignatureAlgorithm = 10;
+# sha-1 signatures parse so they can be named, and never verify
+pub val ECDSA_SHA1:     SignatureAlgorithm = 11;
+pub val RSA_PKCS1_SHA1: SignatureAlgorithm = 12;
+
+# true for an algorithm that parses but is too weak to verify
+pub fun weak(algorithm: SignatureAlgorithm) bool {
+    ret algorithm == ECDSA_SHA1 || algorithm == RSA_PKCS1_SHA1;
+}
 
 pub val KEY_USAGE_DIGITAL_SIGNATURE:  u16 = 1 << 0;
 pub val KEY_USAGE_CONTENT_COMMITMENT: u16 = 1 << 1;
@@ -153,6 +165,12 @@ val OID_ECDSA_SHA384: [8]u8 = [8]u8{
     0x2a, 0x86, 0x48, 0xce,
     0x3d, 0x04, 0x03, 0x03,
 };
+val OID_ECDSA_SHA512: [8]u8 = [8]u8{
+    0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04,
+};
+val OID_ECDSA_SHA1: [7]u8 = [7]u8{
+    0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01,
+};
 val OID_ED25519: [3]u8 = [3]u8{0x2b, 0x65, 0x70};
 val OID_RSA_PSS: [9]u8 = [9]u8{
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a,
@@ -163,11 +181,20 @@ val OID_RSA_PKCS1_SHA256: [9]u8 = [9]u8{
 val OID_RSA_PKCS1_SHA384: [9]u8 = [9]u8{
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c,
 };
+val OID_RSA_PKCS1_SHA512: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d,
+};
+val OID_RSA_PKCS1_SHA1: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05,
+};
 pub val OID_SHA256: [9]u8 = [9]u8{
     0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
 };
 pub val OID_SHA384: [9]u8 = [9]u8{
     0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
+};
+pub val OID_SHA512: [9]u8 = [9]u8{
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
 };
 val OID_MGF1: [9]u8 = [9]u8{
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08,
@@ -232,6 +259,10 @@ fun parse_hash_algorithm(element: *der.Element, output: *u8) bool {
     }
     if (oid_equal(oid.content, (?OID_SHA384[0]), 9)) {
         @output = 48;
+        ret true;
+    }
+    if (oid_equal(oid.content, (?OID_SHA512[0]), 9)) {
+        @output = 64;
         ret true;
     }
     ret false;
@@ -320,6 +351,10 @@ fun parse_pss_parameters(input: contracts.Bytes,
         @output = RSA_PSS_SHA384;
         ret true;
     }
+    if (hash_len == 64 && salt_len == 64) {
+        @output = RSA_PSS_SHA512;
+        ret true;
+    }
     ret false;
 }
 
@@ -335,12 +370,22 @@ fun parse_signature_algorithm(element: *der.Element,
     }
     if (oid_equal(oid.content, (?OID_ECDSA_SHA256[0]), 8)) {
         if (!der.complete(?body)) { ret false; }
-        @output = ECDSA_P256_SHA256;
+        @output = ECDSA_SHA256;
         ret true;
     }
     if (oid_equal(oid.content, (?OID_ECDSA_SHA384[0]), 8)) {
         if (!der.complete(?body)) { ret false; }
-        @output = ECDSA_P384_SHA384;
+        @output = ECDSA_SHA384;
+        ret true;
+    }
+    if (oid_equal(oid.content, (?OID_ECDSA_SHA512[0]), 8)) {
+        if (!der.complete(?body)) { ret false; }
+        @output = ECDSA_SHA512;
+        ret true;
+    }
+    if (oid_equal(oid.content, (?OID_ECDSA_SHA1[0]), 7)) {
+        if (!der.complete(?body)) { ret false; }
+        @output = ECDSA_SHA1;
         ret true;
     }
     if (oid_equal(oid.content, (?OID_ED25519[0]), 3)) {
@@ -355,14 +400,22 @@ fun parse_signature_algorithm(element: *der.Element,
         ret parse_pss_parameters(parameters.encoded, output);
     }
     if (oid_equal(oid.content, (?OID_RSA_PKCS1_SHA256[0]), 9) ||
-        oid_equal(oid.content, (?OID_RSA_PKCS1_SHA384[0]), 9)) {
+        oid_equal(oid.content, (?OID_RSA_PKCS1_SHA384[0]), 9) ||
+        oid_equal(oid.content, (?OID_RSA_PKCS1_SHA512[0]), 9) ||
+        oid_equal(oid.content, (?OID_RSA_PKCS1_SHA1[0]), 9)) {
         var parameter: der.Element;
         if (der.next(?body, ?parameter) != contracts.OK || parameter.tag != der.NULL ||
             parameter.content.len != 0 || !der.complete(?body)) { ret false; }
         if (oid_equal(oid.content, (?OID_RSA_PKCS1_SHA256[0]), 9)) {
             @output = RSA_PKCS1_SHA256;
         }
-        or { @output = RSA_PKCS1_SHA384; }
+        or (oid_equal(oid.content, (?OID_RSA_PKCS1_SHA384[0]), 9)) {
+            @output = RSA_PKCS1_SHA384;
+        }
+        or (oid_equal(oid.content, (?OID_RSA_PKCS1_SHA512[0]), 9)) {
+            @output = RSA_PKCS1_SHA512;
+        }
+        or { @output = RSA_PKCS1_SHA1; }
         ret true;
     }
     ret false;
@@ -409,27 +462,35 @@ pub fun write_signature_algorithm(algorithm: SignatureAlgorithm,
     output: contracts.Buffer) contracts.Operation {
     var value: writer.Writer = writer.into(output);
     val mark:  usize         = writer.open(?value);
-    if (algorithm == ECDSA_P256_SHA256) {
+    if (algorithm == ECDSA_SHA256) {
         writer.element(?value, der.OBJECT_ID,
             contracts.Bytes{data: ?OID_ECDSA_SHA256[0], len: 8});
     }
-    or (algorithm == ECDSA_P384_SHA384) {
+    or (algorithm == ECDSA_SHA384) {
         writer.element(?value, der.OBJECT_ID,
             contracts.Bytes{data: ?OID_ECDSA_SHA384[0], len: 8});
+    }
+    or (algorithm == ECDSA_SHA512) {
+        writer.element(?value, der.OBJECT_ID,
+            contracts.Bytes{data: ?OID_ECDSA_SHA512[0], len: 8});
     }
     or (algorithm == ED25519) {
         writer.element(?value, der.OBJECT_ID,
             contracts.Bytes{data: ?OID_ED25519[0], len: 3});
     }
-    or (algorithm == RSA_PSS_SHA256 || algorithm == RSA_PSS_SHA384) {
+    or (algorithm == RSA_PSS_SHA256 || algorithm == RSA_PSS_SHA384 ||
+        algorithm == RSA_PSS_SHA512) {
         writer.element(?value, der.OBJECT_ID,
             contracts.Bytes{data: ?OID_RSA_PSS[0], len: 9});
         if (algorithm == RSA_PSS_SHA256) { write_pss_parameters(?value, ?OID_SHA256[0], 32); }
-        or                               { write_pss_parameters(?value, ?OID_SHA384[0], 48); }
+        or (algorithm == RSA_PSS_SHA384) { write_pss_parameters(?value, ?OID_SHA384[0], 48); }
+        or                               { write_pss_parameters(?value, ?OID_SHA512[0], 64); }
     }
-    or (algorithm == RSA_PKCS1_SHA256 || algorithm == RSA_PKCS1_SHA384) {
+    or (algorithm == RSA_PKCS1_SHA256 || algorithm == RSA_PKCS1_SHA384 ||
+        algorithm == RSA_PKCS1_SHA512) {
         var oid: *u8 = ?OID_RSA_PKCS1_SHA256[0];
         if (algorithm == RSA_PKCS1_SHA384) { oid = ?OID_RSA_PKCS1_SHA384[0]; }
+        or (algorithm == RSA_PKCS1_SHA512) { oid = ?OID_RSA_PKCS1_SHA512[0]; }
         writer.element(?value, der.OBJECT_ID, contracts.Bytes{data: oid, len: 9});
         writer.element(?value, der.NULL, contracts.Bytes{data: nil, len: 0});
     }
@@ -1621,8 +1682,8 @@ test x509__parse_a_strict_ed25519_server_certificate {
 }
 
 test x509__every_signature_algorithm_encodes_and_parses_back {
-    var algorithm: SignatureAlgorithm = ECDSA_P256_SHA256;
-    for (algorithm <= ECDSA_P384_SHA384) {
+    var algorithm: SignatureAlgorithm = ECDSA_SHA256;
+    for (algorithm <= RSA_PKCS1_SHA512) {
         var encoded: [96]u8;
         var parsed:  SignatureAlgorithm  = SIGNATURE_NONE;
         val made:    contracts.Operation = write_signature_algorithm(algorithm,
