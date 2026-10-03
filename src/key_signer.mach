@@ -1,0 +1,418 @@
+# signer over a private key held in memory with its certificate chain
+
+use crypto.contracts;
+use crypto.encoding.keys;
+use crypto.group.p256;
+use crypto.secret;
+use crypto.signature;
+use pki.cert;
+use pki.load;
+use contract: pki.signer;
+use pki.verify;
+use pki.x509;
+use std.crypto.ct;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str_len;
+
+# what signing needs besides the secret: the key's algorithm, its rsa public
+# parts and the chain
+pub rec KeyState {
+    algorithm:    keys.Algorithm;
+    modulus:      [512]u8;
+    modulus_len:  usize;
+    exponent:     [512]u8;
+    exponent_len: usize;
+    chain:        cert.Chain;
+    certificates: [verify.MAX_CHAIN_DEPTH]cert.Certificate;
+}
+
+# an open key signer. it owns its key, borrows its chain's der, and must not
+# move while a contract.Signer made from it is in use
+pub rec KeySigner {
+    state: KeyState;
+    key:   keys.PrivateKey;
+    # the rsa private exponent padded to the modulus length, empty otherwise
+    rsa_private: secret.Secret;
+}
+
+fun bytes_equal(first: *u8, first_len: usize, second: contracts.Bytes) bool {
+    if (first_len != second.len || first == nil || second.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < first_len) {
+        if (first[i] != second.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun map_error(error: contracts.Error) contract.Error {
+    if (error == contracts.OK)                  { ret contract.OK; }
+    if (error == contracts.ENTROPY_UNAVAILABLE) { ret contract.UNAVAILABLE; }
+    if (error == contracts.INVALID_INPUT)       { ret contract.INVALID_INPUT; }
+    if (error == contracts.UNSUPPORTED)         { ret contract.UNSUPPORTED_ALGORITHM; }
+    ret contract.FAILED;
+}
+
+fun failed(error: contract.Error) contract.Result {
+    ret contract.Result{error: error, written: 0};
+}
+
+fun algorithm_at(key: keys.Algorithm, index: usize) x509.SignatureAlgorithm {
+    if (key == keys.ED25519 && index == 0) { ret x509.ED25519; }
+    if (key == keys.P256 && index == 0)    { ret x509.ECDSA_P256_SHA256; }
+    if (key == keys.RSA) {
+        if (index == 0) { ret x509.RSA_PSS_SHA256; }
+        if (index == 1) { ret x509.RSA_PSS_SHA384; }
+    }
+    ret x509.SIGNATURE_NONE;
+}
+
+fun size_of(state: *KeyState, wanted: x509.SignatureAlgorithm) usize {
+    if (state.algorithm == keys.ED25519 && wanted == x509.ED25519) {
+        ret signature.ED25519_SIGNATURE_SIZE;
+    }
+    if (state.algorithm == keys.P256 && wanted == x509.ECDSA_P256_SHA256) {
+        ret signature.ECDSA_P256_SIGNATURE_MAX_SIZE;
+    }
+    if (state.algorithm == keys.RSA &&
+        (wanted == x509.RSA_PSS_SHA256 || wanted == x509.RSA_PSS_SHA384)) {
+        ret state.modulus_len;
+    }
+    ret 0;
+}
+
+# the signing secret: the ed25519 seed or p-256 scalar, or the padded rsa
+# private exponent
+fun signing_secret(value: *KeySigner, output: *contracts.SecretBytes) contracts.Error {
+    if (value.state.algorithm == keys.RSA) {
+        ret secret.bytes(?value.rsa_private, 0, value.state.modulus_len, output);
+    }
+    ret keys.private_bytes(?value.key, output);
+}
+
+# check that the key is the private half of public_key and fill the state
+fun prepare(value: *KeySigner, public_key: *keys.PublicKey) contract.Error {
+    val algorithm: keys.Algorithm = value.key.algorithm;
+    if (algorithm != public_key.algorithm) { ret contract.KEY_MISMATCH; }
+    value.state.algorithm = algorithm;
+    if (algorithm == keys.RSA) {
+        val allocated: contracts.Error = secret.init(?value.rsa_private,
+            value.key.material.owner, value.key.modulus_len);
+        if (allocated != contracts.OK) { ret map_error(allocated); }
+        var padded: contracts.SecretBuffer;
+        var status: contracts.Error = secret.buffer(?value.rsa_private, 0,
+            value.key.modulus_len, ?padded);
+        if (status == contracts.OK) {
+            status = keys.copy_rsa(?value.key,
+                contracts.Buffer{data: ?value.state.modulus[0], capacity: 512},
+                contracts.Buffer{data: ?value.state.exponent[0], capacity: 512}, padded);
+        }
+        if (status != contracts.OK) { ret map_error(status); }
+        value.state.modulus_len  = value.key.modulus_len;
+        value.state.exponent_len = value.key.exponent_len;
+        if (!bytes_equal(?value.state.modulus[0], value.state.modulus_len,
+            public_key.first) || !bytes_equal(?value.state.exponent[0],
+            value.state.exponent_len, public_key.second)) { ret contract.KEY_MISMATCH; }
+        ret contract.OK;
+    }
+    var private_key: contracts.SecretBytes;
+    val viewed:      contracts.Error = keys.private_bytes(?value.key, ?private_key);
+    if (viewed != contracts.OK) { ret map_error(viewed); }
+    var derived: [65]u8;
+    var made:    contracts.Operation;
+    if (algorithm == keys.ED25519) {
+        made = signature.derive_ed25519_public(private_key,
+            contracts.Buffer{data: ?derived[0], capacity: 65});
+    }
+    or (algorithm == keys.P256) {
+        made = p256.derive_public(private_key,
+            contracts.Buffer{data: ?derived[0], capacity: 65});
+    }
+    or                              { ret contract.UNSUPPORTED_ALGORITHM; }
+    if (made.error != contracts.OK) { ret map_error(made.error); }
+    if (!bytes_equal(?derived[0], made.written, public_key.first)) {
+        ret contract.KEY_MISMATCH;
+    }
+    ret contract.OK;
+}
+
+fun context_algorithm(context: ptr, index: usize) x509.SignatureAlgorithm {
+    val state: *KeyState = context::*KeyState;
+    ret algorithm_at(state.algorithm, index);
+}
+
+fun context_chain(context: ptr) cert.Chain {
+    val state: *KeyState = context::*KeyState;
+    ret state.chain;
+}
+
+fun context_signature_size(context: ptr, wanted: x509.SignatureAlgorithm) usize {
+    val state: *KeyState = context::*KeyState;
+    ret size_of(state, wanted);
+}
+
+fun sign_rsa(state: *KeyState, private_exponent: *^u8,
+    wanted: x509.SignatureAlgorithm, message: contracts.Bytes,
+    output: contracts.Buffer) contracts.Operation {
+    var salt_len: usize = signature.RSA_PSS_SHA256_SALT_SIZE;
+    if (wanted == x509.RSA_PSS_SHA384) { salt_len = signature.RSA_PSS_SHA384_SALT_SIZE; }
+    var entropy: secret.Entropy = secret.system_entropy();
+    var salt:    [48]^u8;
+    if (entropy.fill_fn(entropy.context, entropy.secret_context, ?salt[0],
+        salt_len) != 0) {
+        ct.zeroize(?salt[0], 48);
+        ret contracts.Operation{error: contracts.ENTROPY_UNAVAILABLE, written: 0};
+    }
+    val private_key: signature.RsaPrivateKey = signature.RsaPrivateKey{
+        modulus:         contracts.Bytes{data: ?state.modulus[0], len: state.modulus_len},
+        public_exponent: contracts.Bytes{data: ?state.exponent[0],
+            len: state.exponent_len},
+        private_exponent: contracts.SecretBytes{data: private_exponent,
+            len: state.modulus_len},
+    };
+    val salt_bytes: contracts.SecretBytes = contracts.SecretBytes{data: ?salt[0],
+        len: salt_len};
+    var made: contracts.Operation;
+    if (wanted == x509.RSA_PSS_SHA256) {
+        made = signature.sign_rsa_pss_sha256(private_key, message, salt_bytes, output);
+    }
+    or { made = signature.sign_rsa_pss_sha384(private_key, message, salt_bytes, output); }
+    ct.zeroize(?salt[0], 48);
+    ret made;
+}
+
+fun context_sign(context: ptr, secret_context: *^u8, wanted: x509.SignatureAlgorithm,
+    message: contracts.Bytes, output: contracts.Buffer) contract.Result {
+    val state: *KeyState = context::*KeyState;
+    if (size_of(state, wanted) == 0) { ret failed(contract.UNSUPPORTED_ALGORITHM); }
+    if (secret_context == nil)       { ret failed(contract.INVALID_INPUT); }
+    var made: contracts.Operation;
+    if (state.algorithm == keys.RSA) {
+        made = sign_rsa(state, secret_context, wanted, message, output);
+    }
+    or (state.algorithm == keys.ED25519) {
+        made = signature.sign_ed25519(contracts.SecretBytes{data: secret_context,
+            len: signature.ED25519_PRIVATE_KEY_SIZE}, message, output);
+    }
+    or {
+        made = signature.sign_ecdsa_p256_sha256(contracts.SecretBytes{
+            data: secret_context, len: signature.ECDSA_P256_PRIVATE_KEY_SIZE
+        },
+            message, output);
+    }
+    if (made.error != contracts.OK) { ret failed(map_error(made.error)); }
+    ret contract.Result{error: contract.OK, written: made.written};
+}
+
+# open a signer over key and the leaf-first chain
+#
+# the key must be the private half of the leaf's public key and sign with at
+# least one supported algorithm. on success the signer owns the key and the
+# caller's key is left empty. on failure the caller keeps it. the chain's der
+# is borrowed and must outlive the signer. rsa-pss salts come from the
+# operating system.
+pub fun open(output: *KeySigner, key: *keys.PrivateKey, chain: cert.Chain) contract.Error {
+    if (output == nil || key == nil || chain.certificates == nil || chain.len == 0 ||
+        chain.len > verify.MAX_CHAIN_DEPTH) { ret contract.INVALID_INPUT; }
+    if (algorithm_at(key.algorithm, 0) == x509.SIGNATURE_NONE) {
+        ret contract.UNSUPPORTED_ALGORITHM;
+    }
+    var leaf: x509.Certificate;
+    if (x509.parse(contracts.Bytes{data: chain.certificates[0].der,
+        len: chain.certificates[0].der_len}, ?leaf) != contracts.OK) {
+        ret contract.INVALID_INPUT;
+    }
+    var opened: KeySigner;
+    opened.key         = @key;
+    opened.rsa_private = secret.empty();
+    val prepared: contract.Error = prepare(?opened, ?leaf.public_key);
+    if (prepared != contract.OK) {
+        secret.destroy(?opened.rsa_private);
+        ret prepared;
+    }
+    var i: usize = 0;
+    for (i < chain.len) {
+        opened.state.certificates[i] = chain.certificates[i];
+        i                            = i + 1;
+    }
+    @output            = opened;
+    output.state.chain = cert.Chain{certificates: ?output.state.certificates[0],
+        len: chain.len};
+    @key = keys.empty_private();
+    ret contract.OK;
+}
+
+# open a signer from a pem private key and a leaf-first pem certificate chain
+#
+# key_pem holds a PRIVATE KEY, EC PRIVATE KEY or RSA PRIVATE KEY block. the
+# chain's der is decoded into der_output, which must outlive the signer. owner
+# allocates the key and must outlive the signer.
+pub fun open_pem(output: *KeySigner, key_pem: contracts.SecretBytes,
+    chain_pem: contracts.Bytes, der_output: contracts.Buffer,
+    owner: *secret.Allocator) contract.Error {
+    if (output == nil || owner == nil) { ret contract.INVALID_INPUT; }
+    var certificates: [verify.MAX_CHAIN_DEPTH]cert.Certificate;
+    var chain:        cert.Chain;
+    val loaded:       contracts.Operation = load.chain_pem(chain_pem, der_output,
+        ?certificates[0], verify.MAX_CHAIN_DEPTH, ?chain);
+    if (loaded.error == contracts.OUTPUT_TOO_SMALL) { ret contract.OUTPUT_TOO_SMALL; }
+    if (loaded.error != contracts.OK)               { ret contract.INVALID_INPUT; }
+    var key:     keys.PrivateKey = keys.empty_private();
+    val decoded: contracts.Error = load.private_pem(key_pem, owner, ?key);
+    if (decoded == contracts.UNSUPPORTED) { ret contract.UNSUPPORTED_ALGORITHM; }
+    if (decoded != contracts.OK)          { ret contract.INVALID_INPUT; }
+    val opened: contract.Error = open(output, ?key, chain);
+    if (opened != contract.OK) { keys.destroy_private(?key); }
+    ret opened;
+}
+
+# destroy the signer's key
+pub fun close(value: *KeySigner) contract.Error {
+    if (value == nil) { ret contract.INVALID_INPUT; }
+    var empty: cert.Chain;
+    value.state.chain = empty;
+    val padded: contracts.Error = secret.destroy(?value.rsa_private);
+    if (keys.destroy_private(?value.key) != contracts.OK || padded != contracts.OK) {
+        ret contract.FAILED;
+    }
+    ret contract.OK;
+}
+
+# the contract over an open key signer, valid until it is closed or moved
+pub fun signer(value: *KeySigner) contract.Signer {
+    var closed:       contract.Signer;
+    var secret_bytes: contracts.SecretBytes;
+    if (value == nil || signing_secret(value, ?secret_bytes) != contracts.OK) {
+        ret closed;
+    }
+    ret contract.Signer{
+        context:           (?value.state)::ptr,
+        secret_context:    secret_bytes.data,
+        algorithm_fn:      context_algorithm,
+        chain_fn:          context_chain,
+        signature_size_fn: context_signature_size,
+        sign_fn:           context_sign,
+    };
+}
+
+#[testing]
+val ED25519_KEY:         *u8 = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID3W1usvCR9MVk+mYJ2tNmwYTidka/byZk+xkN23NTb3\n-----END PRIVATE KEY-----\n"::*u8;
+#[testing]
+val ED25519_CHAIN:       *u8 = "-----BEGIN CERTIFICATE-----\nMIIBkzCCAUWgAwIBAgIJAPpaqeCNecDcMAUGAytlcDA+MQswCQYDVQQGEwJVUzET\nMBEGA1UECgwKQnJpYXIgVGVzdDEaMBgGA1UEAwwRQnJpYXIgVGVzdCBTaWduZXIw\nHhcNMjYxMDAzMDE1OTU3WhcNMzYwOTMwMDE1OTU3WjA+MQswCQYDVQQGEwJVUzET\nMBEGA1UECgwKQnJpYXIgVGVzdDEaMBgGA1UEAwwRQnJpYXIgVGVzdCBTaWduZXIw\nKjAFBgMrZXADIQAPJRSlYETWHJccj5xuYpoYAnuCzI3dckMDnW4QiCt6/qNgMF4w\nHQYDVR0OBBYEFLgbtGjbBfRrzhp/yLKiijLJ3vZpMB8GA1UdIwQYMBaAFLgbtGjb\nBfRrzhp/yLKiijLJ3vZpMA4GA1UdDwEB/wQEAwIGwDAMBgNVHRMBAf8EAjAAMAUG\nAytlcANBAGg5VveAU+YA+02YFz9j1+v1p/3JID3bwmKVcbFR1AgBn+nAGjRDU6bE\nT9BuIBW2R7zKqPVG4sfRSVTo4LXp+Qg=\n-----END CERTIFICATE-----\n"::*u8;
+#[testing]
+val OTHER_ED25519_CHAIN: *u8 = "-----BEGIN CERTIFICATE-----\nMIIBjzCCAUGgAwIBAgIUM/gdP3oot5cc+7EhgspDO6iVlm4wBQYDK2VwMD0xCzAJ\nBgNVBAYTAlVTMRMwEQYDVQQKDApCcmlhciBUZXN0MRkwFwYDVQQDDBBCcmlhciBU\nZXN0IE90aGVyMB4XDTI2MTAwMzAyMDEzMloXDTM2MDkzMDAyMDEzMlowPTELMAkG\nA1UEBhMCVVMxEzARBgNVBAoMCkJyaWFyIFRlc3QxGTAXBgNVBAMMEEJyaWFyIFRl\nc3QgT3RoZXIwKjAFBgMrZXADIQDrkwIqJ3HGobkTj7mdycR/Sje0XhFFgQzi85oB\nfhM/pqNTMFEwHQYDVR0OBBYEFEUB9LeSJECqlmScfdmSbtPmAONeMB8GA1UdIwQY\nMBaAFEUB9LeSJECqlmScfdmSbtPmAONeMA8GA1UdEwEB/wQFMAMBAf8wBQYDK2Vw\nA0EAWxsPsydJ8C6Rhh4mPGr1oJxafeFVOL+A9NJZ8Pp2RciBlJQ/BfEW7GX9F2Ki\ng7ptsMzDn/uFsyromqWDP457Dw==\n-----END CERTIFICATE-----\n"::*u8;
+#[testing]
+val P256_KEY:            *u8 = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIARrK1mnSyr9TOhIvzTBXF3k335Xk2i0a4Be2gkkH+ggoAoGCCqGSM49\nAwEHoUQDQgAEAIciYCcqYN49LgLrLdfLWoyqgCEI+pTETs4O12daDMrIUh0nP2r0\n6hErai5hdsGPUQyrBdanuZwUqv3xe4Mi4w==\n-----END EC PRIVATE KEY-----\n"::*u8;
+#[testing]
+val P256_CHAIN:          *u8 = "-----BEGIN CERTIFICATE-----\nMIIB0zCCAXigAwIBAgIIe3wdTqbtT/IwCgYIKoZIzj0EAwIwPjELMAkGA1UEBhMC\nVVMxEzARBgNVBAoMCkJyaWFyIFRlc3QxGjAYBgNVBAMMEUJyaWFyIFRlc3QgU2ln\nbmVyMB4XDTI2MTAwMzAxNTk1N1oXDTM2MDkzMDAxNTk1N1owPjELMAkGA1UEBhMC\nVVMxEzARBgNVBAoMCkJyaWFyIFRlc3QxGjAYBgNVBAMMEUJyaWFyIFRlc3QgU2ln\nbmVyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAIciYCcqYN49LgLrLdfLWoyq\ngCEI+pTETs4O12daDMrIUh0nP2r06hErai5hdsGPUQyrBdanuZwUqv3xe4Mi46Ng\nMF4wHQYDVR0OBBYEFMwxI2uQZ+B0RqGXv9wKUkukVKuhMB8GA1UdIwQYMBaAFMwx\nI2uQZ+B0RqGXv9wKUkukVKuhMA4GA1UdDwEB/wQEAwIGwDAMBgNVHRMBAf8EAjAA\nMAoGCCqGSM49BAMCA0kAMEYCIQD96CqHsokbzIdwPxYhO0ccQOC1DCVgnBjN8hrE\nq9m0+wIhALEQsFtMNlC93PictvlEvZAq5QqgEXwevsWpe0aR5hkw\n-----END CERTIFICATE-----\n"::*u8;
+#[testing]
+val RSA_KEY:             *u8 = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDBPBzmH07acc50\n2jlbwRfPBgLk7fsFbq5jQjLd8Fy2Mi7D25CC7snLJQkDI3xn+Qz5hQv+kz6rkWEf\nnSQRUDoJrTl2NnzIJvHgH4ifc9p7HIvYRgBPBEvoJdO1iJBrRbLEAvThP6kHE11A\nbUIB2bHY2siLGB2flYUllWEN6phCckxtGUk/BW6U8vO8aeXMuZyOYgqTwkblOOIa\nj1MU9K7/nTbnxz+mRs4Dz/aXyDYRUN/5wen5p70ooOzr7QYWUw7I0g+/PgkuOvJL\n9pqvVIQ0rRtGHjmpiOqCEOiN7uTDN0CnW/wZXcpycC3toMpve7ahKVMhRBzXS61G\nHc8ltXC7AgMBAAECggEALrniBRWKBFGjymbgmtrg7ns2JPSVEDW47qCZ20gdqyMM\nYukLk1W5rylX+g3RLfUv2YB+K4Ogkm03rqTZjWQ4fJGKRRcc6mtcbsVBTMl/ieiX\numcG+RSBZHQNMycAQShb94D9hSBXN7JLiOJCpV7mXhldiCD/PNEznqh2DR7uzZYY\nduDRGX32Kihi17sCVlFPu4RK7xCeqisr8DJGtaNrHQk44cB39sjHVkX/NLyBpJ3r\nrPoKd/69Z2aK5vnoYMkIsp3BPUUFptETfep9KT3AM30F7/c6qSbS4gRqc2lYWqpd\nyiuRrwgF/AzPT2y3vvGUPyTSpEQm3I4BaBa7OpslSQKBgQD+FQrO28yLLK+61VtE\n6ECN19rhC/ai45w9pSCS3l0co2PAZkOameca1KOU8a9+VycFoRRVv9TYfNSBLHR2\n6Ogr2+iWTJteyh53nAAHkLHBzMM9gcZsszRPIYYlfMHukMuNi8YrIxZ26Ybfd5NZ\nxLxxqWxM8ncRUDb7iPclrkaI0wKBgQDCsX8cqlS8N0ApPUoXE+P0nnlskEqlwy3w\nA1FJmqfgBWx8jlW3K0Otzd1TAnICvHTRmcZoldl+Z/gIHjeO3gvinbfLkvzSeL6H\n5sQNSdU5rtV7LfJkXgHE0pvDuV/A6bVIHIIebT/Obtmp44kaouxiZYs5lVNQkw+n\npjGqcDsHeQKBgQD0SgD5QIVaLp3K8cXt66vddPNiOuFoXZTkBDbcXuWBWmrXGrvX\nEjAMMPQSiYkk3OCM3gGyLF2Vw/eBNt/HUEmhma73izI7IfPHJns0yt7NqXTyVysT\naf1aM65Jrri7CgZb0k63POYlcIQXqV1ICwrv8WhKVzk5sTkcAOU3GmeAtwKBgC05\nO5R2AD7D+rRZlzcrGJ0+nmfYUG6WmroQmzYkpXAE8oEwMrrcYtkhY5Kfk8oM6nmx\nZYPvotiY3+VK147pBwu5pPK1juJ4x5Ebylhn2Q6QDOiS8KXdrD2Cykm5aoOOBdzd\nOmBE8jhKSWcMAlHcnFnyylcy12p07oL7uLelYCDJAoGAZL1aXFRJJyJb49NTiaCY\neFGJH8eaTgIu0sy6oPowsx3ICGCmF9CM1Ya4AIBqN1eZOwmwOlhuFYgnqlTpmYYy\n9yjvOBPj2uNVS6/qjPHAXT7foOwlN+eIAHyAxcN1AzsaD6j2fSWQSO8fWmZQlxKc\nFZg8HOi4vy89GsgB03duufQ=\n-----END PRIVATE KEY-----\n"::*u8;
+#[testing]
+val RSA_CHAIN:           *u8 = "-----BEGIN CERTIFICATE-----\nMIIDXjCCAkagAwIBAgIIP3mvrXYQEC4wDQYJKoZIhvcNAQELBQAwPjELMAkGA1UE\nBhMCVVMxEzARBgNVBAoMCkJyaWFyIFRlc3QxGjAYBgNVBAMMEUJyaWFyIFRlc3Qg\nU2lnbmVyMB4XDTI2MTAwMzAxNTk1N1oXDTM2MDkzMDAxNTk1N1owPjELMAkGA1UE\nBhMCVVMxEzARBgNVBAoMCkJyaWFyIFRlc3QxGjAYBgNVBAMMEUJyaWFyIFRlc3Qg\nU2lnbmVyMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwTwc5h9O2nHO\ndNo5W8EXzwYC5O37BW6uY0Iy3fBctjIuw9uQgu7JyyUJAyN8Z/kM+YUL/pM+q5Fh\nH50kEVA6Ca05djZ8yCbx4B+In3PaexyL2EYATwRL6CXTtYiQa0WyxAL04T+pBxNd\nQG1CAdmx2NrIixgdn5WFJZVhDeqYQnJMbRlJPwVulPLzvGnlzLmcjmIKk8JG5Tji\nGo9TFPSu/50258c/pkbOA8/2l8g2EVDf+cHp+ae9KKDs6+0GFlMOyNIPvz4JLjry\nS/aar1SENK0bRh45qYjqghDoje7kwzdAp1v8GV3KcnAt7aDKb3u2oSlTIUQc10ut\nRh3PJbVwuwIDAQABo2AwXjAdBgNVHQ4EFgQUEh3Z8kMR+KApgs5BXKhZTFGvs8Iw\nHwYDVR0jBBgwFoAUEh3Z8kMR+KApgs5BXKhZTFGvs8IwDgYDVR0PAQH/BAQDAgbA\nMAwGA1UdEwEB/wQCMAAwDQYJKoZIhvcNAQELBQADggEBADqSPbBvWmJBeFUu70cN\nHI+5ou1MHi+LXZSjJZaj7ZVSqg8ty+hAeGfs2OhnC8U1I92iGEvTt6nMDQVxo7Md\ngK9hFZmQ/hoyz9LFhAg7QKF8g8ZW7eC89S19edbIMqRKMOCCfZMVs01Cqp8MAxdy\nkgScMC9SzFzrP9D4FhBsQU7PgNtWp+MPl5rkYtr/dr6sBBPWUukqPsO8lW5ePGKY\nOjHYiiFtJwl8D0mKNIzoSqFzlqyoOcW983OUqcy2cUijoKBImNExX6INjAbgpOUS\n3rtD9cS1NC5mZrzDZ6pARFfb+r8hvECuuHESxKeOAmut8HQoBDP90LMRsmhJ5xC9\nFmY=\n-----END CERTIFICATE-----\n"::*u8;
+
+#[testing]
+rec Fixture {
+    der:    [2048]u8;
+    owner:  secret.Allocator;
+    signer: KeySigner;
+}
+
+#[testing]
+fun open_fixture(fixture: *Fixture, key_pem: *u8, chain_pem: *u8) contract.Error {
+    var key:     [2048]^u8;
+    val key_len: usize = str_len(key_pem);
+    var i:       usize = 0;
+    for (i < key_len) {
+        key[i] = key_pem[i];
+        i      = i + 1;
+    }
+    fixture.owner = secret.system_allocator();
+    val opened: contract.Error = open_pem(?fixture.signer,
+        contracts.SecretBytes{data: ?key[0], len: key_len},
+        contracts.Bytes{data: chain_pem, len: str_len(chain_pem)},
+        contracts.Buffer{data: ?fixture.der[0], capacity: 2048}, ?fixture.owner);
+    ct.zeroize(?key[0], 2048);
+    ret opened;
+}
+
+# sign through the contract and verify under the leaf's public key
+#[testing]
+fun signs_and_verifies(value: *contract.Signer,
+    wanted: x509.SignatureAlgorithm) bool {
+    var message: [11]u8          = [11]u8{'s', 'i', 'g', 'n', 'e', 'd', ' ', 'a', 't', 't', 'r'};
+    var output:  [512]u8;
+    val made:    contract.Result = contract.sign(value, wanted,
+        contracts.Bytes{data: ?message[0], len: 11},
+        contracts.Buffer{data: ?output[0], capacity: 512});
+    if (made.error != contract.OK || made.written == 0 ||
+        made.written > contract.signature_size(value, wanted)) { ret false; }
+    val presented: cert.Chain = contract.chain(value);
+    var leaf:      x509.Certificate;
+    if (presented.len != 1 || x509.parse(contracts.Bytes{
+        data: presented.certificates[0].der, len: presented.certificates[0].der_len
+    },
+        ?leaf) != contracts.OK) { ret false; }
+    if (verify.message(?leaf.public_key, wanted,
+        contracts.Bytes{data: ?message[0], len: 11},
+        contracts.Bytes{data: ?output[0], len: made.written}) != verify.OK) { ret false; }
+    message[0] = 'S';
+    ret verify.message(?leaf.public_key, wanted,
+        contracts.Bytes{data: ?message[0], len: 11},
+        contracts.Bytes{data: ?output[0], len: made.written}) == verify.BAD_SIGNATURE;
+}
+
+test key_signer__ed25519_key_signs_the_message_itself {
+    var fixture: Fixture;
+    if (open_fixture(?fixture, ED25519_KEY, ED25519_CHAIN) != contract.OK) { ret 1; }
+    var value: contract.Signer = signer(?fixture.signer);
+    if (contract.algorithm(?value, 0) != x509.ED25519 ||
+        contract.algorithm(?value, 1) != x509.SIGNATURE_NONE ||
+        contract.signature_size(?value, x509.ED25519) != 64) { ret 2; }
+    if (!signs_and_verifies(?value, x509.ED25519)) { ret 3; }
+    if (close(?fixture.signer) != contract.OK)     { ret 4; }
+    ret 0;
+}
+
+test key_signer__ecdsa_p256_sec1_key_signs {
+    var fixture: Fixture;
+    if (open_fixture(?fixture, P256_KEY, P256_CHAIN) != contract.OK) { ret 1; }
+    var value: contract.Signer = signer(?fixture.signer);
+    if (contract.algorithm(?value, 0) != x509.ECDSA_P256_SHA256 ||
+        contract.supports(?value, x509.ECDSA_P384_SHA384)) { ret 2; }
+    if (!signs_and_verifies(?value, x509.ECDSA_P256_SHA256)) { ret 3; }
+    if (close(?fixture.signer) != contract.OK)               { ret 4; }
+    ret 0;
+}
+
+test key_signer__rsa_key_signs_pss_and_not_pkcs1 {
+    var fixture: Fixture;
+    if (open_fixture(?fixture, RSA_KEY, RSA_CHAIN) != contract.OK) { ret 1; }
+    var value: contract.Signer = signer(?fixture.signer);
+    if (contract.algorithm(?value, 0) != x509.RSA_PSS_SHA256 ||
+        contract.algorithm(?value, 1) != x509.RSA_PSS_SHA384 ||
+        contract.algorithm(?value, 2) != x509.SIGNATURE_NONE ||
+        contract.signature_size(?value, x509.RSA_PSS_SHA256) != 256) { ret 2; }
+    var output: [256]u8;
+    if (contract.sign(?value, x509.RSA_PKCS1_SHA256,
+        contracts.Bytes{data: nil, len: 0},
+        contracts.Buffer{data: ?output[0], capacity: 256}).error !=
+        contract.UNSUPPORTED_ALGORITHM) { ret 3; }
+    if (!signs_and_verifies(?value, x509.RSA_PSS_SHA256) ||
+        !signs_and_verifies(?value, x509.RSA_PSS_SHA384)) { ret 4; }
+    if (close(?fixture.signer) != contract.OK) { ret 5; }
+    ret 0;
+}
+
+test key_signer__a_key_must_belong_to_the_leaf {
+    var fixture: Fixture;
+    if (open_fixture(?fixture, ED25519_KEY, OTHER_ED25519_CHAIN) !=
+        contract.KEY_MISMATCH ||
+        open_fixture(?fixture, ED25519_KEY, P256_CHAIN) != contract.KEY_MISMATCH ||
+        open_fixture(?fixture, RSA_KEY, ED25519_CHAIN) != contract.KEY_MISMATCH) {
+        ret 1;
+    }
+    ret 0;
+}
