@@ -142,7 +142,7 @@ rec RemoteSigner {
 
 #[testing]
 fun remote_algorithm(context: ptr, index: usize) x509.SignatureAlgorithm {
-    if (index == 0) { ret x509.ECDSA_P384_SHA384; }
+    if (index == 0) { ret x509.ECDSA_SHA384; }
     if (index == 1) { ret x509.RSA_PKCS1_SHA256; }
     ret x509.SIGNATURE_NONE;
 }
@@ -155,8 +155,8 @@ fun remote_chain(context: ptr) cert.Chain {
 
 #[testing]
 fun remote_signature_size(context: ptr, wanted: x509.SignatureAlgorithm) usize {
-    if (wanted == x509.ECDSA_P384_SHA384) { ret 104; }
-    if (wanted == x509.RSA_PKCS1_SHA256)  { ret 256; }
+    if (wanted == x509.ECDSA_SHA384)     { ret 104; }
+    if (wanted == x509.RSA_PKCS1_SHA256) { ret 256; }
     ret 0;
 }
 
@@ -193,7 +193,7 @@ test signer__a_signer_without_a_key_drops_in {
         signature_size_fn: remote_signature_size,
         sign_fn:           remote_sign,
     };
-    if (algorithm(?value, 0) != x509.ECDSA_P384_SHA384 ||
+    if (algorithm(?value, 0) != x509.ECDSA_SHA384 ||
         algorithm(?value, 2) != x509.SIGNATURE_NONE ||
         !supports(?value, x509.RSA_PKCS1_SHA256) ||
         supports(?value, x509.ED25519)) { ret 1; }
@@ -203,17 +203,17 @@ test signer__a_signer_without_a_key_drops_in {
     var message: [5]u8           = [5]u8{'h', 'e', 'l', 'l', 'o'};
     var output:  [104]u8;
     val bytes:   contracts.Bytes = contracts.Bytes{data: ?message[0], len: 5};
-    val short:   Result          = sign(?value, x509.ECDSA_P384_SHA384, bytes,
+    val short:   Result          = sign(?value, x509.ECDSA_SHA384, bytes,
         contracts.Buffer{data: ?output[0], capacity: 103});
     val unsupported: Result = sign(?value, x509.ED25519, bytes,
         contracts.Buffer{data: ?output[0], capacity: 104});
     if (short.error != OUTPUT_TOO_SMALL || short.written != 104 ||
         unsupported.error != UNSUPPORTED_ALGORITHM || remote.calls != 0) { ret 3; }
 
-    var attempt: Result = sign(?value, x509.ECDSA_P384_SHA384, bytes,
+    var attempt: Result = sign(?value, x509.ECDSA_SHA384, bytes,
         contracts.Buffer{data: ?output[0], capacity: 104});
     if (attempt.error != UNAVAILABLE || !transient(attempt.error)) { ret 4; }
-    attempt = sign(?value, x509.ECDSA_P384_SHA384, bytes,
+    attempt = sign(?value, x509.ECDSA_SHA384, bytes,
         contracts.Buffer{data: ?output[0], capacity: 104});
     if (attempt.error != OK || attempt.written != 8 || output[7] != 0xa7 ||
         remote.calls != 2 || remote.last_message.data != ?message[0] ||

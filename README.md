@@ -86,11 +86,16 @@ and internal space compression. Non-ASCII UTF8String values match only exactly.
 
 ## Keys and signatures
 
-Subject public keys are Ed25519, P-256, P-384, and RSA with 2048 through
-4096-bit moduli. Certificate signatures are Ed25519, ECDSA P-256 with SHA-256,
-ECDSA P-384 with SHA-384, RSA-PSS with SHA-256 or SHA-384, and RSA PKCS #1 v1.5
-with SHA-256 or SHA-384. RSA-PSS parameters must name the same supported hash
-for the message and MGF1 and a salt as long as the hash.
+Subject public keys are Ed25519, P-256, P-384, P-521, and RSA with 2048 through
+4096-bit moduli. Certificate signatures are Ed25519, ECDSA with SHA-256, SHA-384
+or SHA-512 over a key on any of the three curves (the digest is independent of
+the curve), RSA-PSS with SHA-256, SHA-384 or SHA-512, and RSA PKCS #1 v1.5 with
+SHA-256, SHA-384 or SHA-512. RSA-PSS parameters must name the same supported
+hash for the message and MGF1 and a salt as long as the hash.
+
+SHA-1 signatures (sha1WithRSAEncryption, ecdsa-with-SHA1) parse so they can be
+named, report `UNSUPPORTED_ALGORITHM` and never `BAD_SIGNATURE`, and
+`x509.weak` tells them apart.
 
 `verify.message` checks a signature over any content under a certificate's
 public key with one of these algorithms.
@@ -217,7 +222,7 @@ signed data.
 The algorithm is the one the caller names or the signer's first, and the digest
 algorithm follows it (`cms.digest_algorithm`): the algorithm's own hash, and
 SHA-512 for Ed25519, which signs the signed attributes directly (RFC 8419).
-RSA-PSS carries its RSASSA-PSS parameters. The encodings for ECDSA P-384 and
+RSA-PSS carries its RSASSA-PSS parameters. The encodings for the other ECDSA digests and
 RSA PKCS #1 v1.5 are in place for signers that offer them. `cms.build` measures
 its output before the signer is asked, so a short output reports the size
 needed and never spends a signature.
