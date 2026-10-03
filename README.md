@@ -18,6 +18,9 @@ certificate model. It depends on mach-std and mach-crypto only.
 - `pki.verify` builds and validates a certification path for a purpose, checks
   a certificate's DNS or IP identity, and checks a signature under a
   certificate's key.
+- `pki.signer` is the signing contract: a key that never leaves its signer,
+  whether in memory, on a token, in an HSM or behind a remote service.
+- `pki.key_signer` signs with a private key held in memory and its PEM chain.
 
 `use pki;` binds `pki.lib.pki`, which re-exports these modules.
 
@@ -147,6 +150,54 @@ chain. Input and output storage must not overlap.
 `crypto.encoding.keys.PrivateKey`, and `load.private_pem` accepts `PRIVATE
 KEY`, `EC PRIVATE KEY`, and `RSA PRIVATE KEY` blocks. The caller destroys the
 key with `crypto.encoding.keys.destroy_private`.
+
+## Signing
+
+A `signer.Signer` takes the bytes to sign and a `x509.SignatureAlgorithm` and
+returns the signature. The signer hashes when its algorithm hashes first. An
+implementation backed by a device or service that accepts only digests hashes
+locally before sending, and one that takes the message (Ed25519, RFC 8419)
+sends it unchanged. The key never crosses the contract, so a PKCS #11 token, an
+HSM or a remote signing service drops in with no change to callers.
+
+The chain and the supported algorithms are fixed once a signer is open, so a
+caller can build signed attributes from the leaf before signing.
+`signer.algorithm` lists the algorithms in the signer's preference order,
+`signer.supports` asks for one, and `signer.signature_size` bounds the output.
+Only `signer.sign` may block, and it may fail transiently: `UNAVAILABLE` means
+the same call may succeed later (`signer.transient`), while `DENIED` and
+`FAILED` do not. `signer.sign` refuses an unsupported algorithm or a short
+output before the signer is reached.
+
+`key_signer.open_pem` opens a signer from a `PRIVATE KEY`, `EC PRIVATE KEY` or
+`RSA PRIVATE KEY` block and a leaf-first PEM chain, and `key_signer.open` from a
+loaded key and chain. Both refuse a key that is not the private half of the
+leaf's public key with `KEY_MISMATCH`. It signs Ed25519, ECDSA P-256 with
+SHA-256, and RSA-PSS with SHA-256 or SHA-384 with a salt from the operating
+system. ECDSA P-384 and RSA PKCS #1 v1.5 signing wait on mach-crypto, and the
+contract already names both.
+
+```mach
+use crypto.contracts;
+use crypto.secret;
+use pki.key_signer;
+use pki.signer;
+use pki.x509;
+
+# key_pem holds the private key, chain_pem the leaf-first chain, and tbs the
+# bytes to sign
+var der:   [16384]u8;
+var owner: secret.Allocator = secret.system_allocator();
+var keyed: key_signer.KeySigner;
+val opened: signer.Error = key_signer.open_pem(?keyed, key_pem, chain_pem,
+    contracts.Buffer{data: ?der[0], capacity: 16384}, ?owner);
+
+var value:     signer.Signer = key_signer.signer(?keyed);
+var signature: [512]u8;
+val made: signer.Result = signer.sign(?value, x509.ED25519, tbs,
+    contracts.Buffer{data: ?signature[0], capacity: 512});
+key_signer.close(?keyed);
+```
 
 ## Fuzzing
 
