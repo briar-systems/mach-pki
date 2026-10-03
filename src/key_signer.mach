@@ -62,7 +62,7 @@ fun failed(error: contract.Error) contract.Result {
 
 fun algorithm_at(key: keys.Algorithm, index: usize) x509.SignatureAlgorithm {
     if (key == keys.ED25519 && index == 0) { ret x509.ED25519; }
-    if (key == keys.P256 && index == 0)    { ret x509.ECDSA_P256_SHA256; }
+    if (key == keys.P256 && index == 0)    { ret x509.ECDSA_SHA256; }
     if (key == keys.RSA) {
         if (index == 0) { ret x509.RSA_PSS_SHA256; }
         if (index == 1) { ret x509.RSA_PSS_SHA384; }
@@ -74,7 +74,7 @@ fun size_of(state: *KeyState, wanted: x509.SignatureAlgorithm) usize {
     if (state.algorithm == keys.ED25519 && wanted == x509.ED25519) {
         ret signature.ED25519_SIGNATURE_SIZE;
     }
-    if (state.algorithm == keys.P256 && wanted == x509.ECDSA_P256_SHA256) {
+    if (state.algorithm == keys.P256 && wanted == x509.ECDSA_SHA256) {
         ret signature.ECDSA_P256_SIGNATURE_MAX_SIZE;
     }
     if (state.algorithm == keys.RSA &&
@@ -380,10 +380,10 @@ test key_signer__ecdsa_p256_sec1_key_signs {
     var fixture: Fixture;
     if (open_fixture(?fixture, P256_KEY, P256_CHAIN) != contract.OK) { ret 1; }
     var value: contract.Signer = signer(?fixture.signer);
-    if (contract.algorithm(?value, 0) != x509.ECDSA_P256_SHA256 ||
-        contract.supports(?value, x509.ECDSA_P384_SHA384)) { ret 2; }
-    if (!signs_and_verifies(?value, x509.ECDSA_P256_SHA256)) { ret 3; }
-    if (close(?fixture.signer) != contract.OK)               { ret 4; }
+    if (contract.algorithm(?value, 0) != x509.ECDSA_SHA256 ||
+        contract.supports(?value, x509.ECDSA_SHA384)) { ret 2; }
+    if (!signs_and_verifies(?value, x509.ECDSA_SHA256)) { ret 3; }
+    if (close(?fixture.signer) != contract.OK)          { ret 4; }
     ret 0;
 }
 

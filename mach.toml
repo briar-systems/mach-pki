@@ -1,6 +1,6 @@
 [project]
 id = "pki"
-version = "0.2.0"
+version = "0.3.0"
 mach = "^6.8"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -66,4 +66,4 @@ version = "^9.4"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-version = "^0.26"
+version = "^0.28"

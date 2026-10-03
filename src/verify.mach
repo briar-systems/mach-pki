@@ -113,6 +113,10 @@ fun authority_matches(child: *x509.Certificate,
 }
 
 # checks sig over content under key with the certificate signature algorithm
+#
+# ecdsa takes its curve from the key and its digest from the algorithm. sha-1
+# algorithms are weak (x509.weak) and report UNSUPPORTED_ALGORITHM, never
+# BAD_SIGNATURE
 pub fun message(key: *keys.PublicKey, algorithm: x509.SignatureAlgorithm,
     content: contracts.Bytes, sig: contracts.Bytes) Error {
     if (key == nil) { ret INVALID_INPUT; }
@@ -121,16 +125,20 @@ pub fun message(key: *keys.PublicKey, algorithm: x509.SignatureAlgorithm,
         if (key.algorithm != keys.ED25519) { ret BAD_SIGNATURE; }
         status = signature.verify_ed25519(key.first, content, sig);
     }
-    or (algorithm == x509.ECDSA_P256_SHA256) {
-        if (key.algorithm != keys.P256) { ret BAD_SIGNATURE; }
-        status = signature.verify_ecdsa_p256_sha256(key.first, content, sig);
-    }
-    or (algorithm == x509.ECDSA_P384_SHA384) {
-        if (key.algorithm != keys.P384) { ret BAD_SIGNATURE; }
-        status = signature.verify_ecdsa_p384_sha384(key.first, content, sig);
+    or (algorithm == x509.ECDSA_SHA256 || algorithm == x509.ECDSA_SHA384 ||
+        algorithm == x509.ECDSA_SHA512) {
+        var curve: signature.Curve = signature.CURVE_P256;
+        if (key.algorithm == keys.P384) { curve = signature.CURVE_P384; }
+        or (key.algorithm == keys.P521) { curve = signature.CURVE_P521; }
+        or (key.algorithm != keys.P256) { ret BAD_SIGNATURE; }
+        var hash: signature.Hash = signature.HASH_SHA256;
+        if (algorithm == x509.ECDSA_SHA384) { hash = signature.HASH_SHA384; }
+        or (algorithm == x509.ECDSA_SHA512) { hash = signature.HASH_SHA512; }
+        status = signature.verify_ecdsa(curve, hash, key.first, content, sig);
     }
     or (algorithm == x509.RSA_PSS_SHA256 || algorithm == x509.RSA_PSS_SHA384 ||
-        algorithm == x509.RSA_PKCS1_SHA256 || algorithm == x509.RSA_PKCS1_SHA384) {
+        algorithm == x509.RSA_PSS_SHA512 || algorithm == x509.RSA_PKCS1_SHA256 ||
+        algorithm == x509.RSA_PKCS1_SHA384 || algorithm == x509.RSA_PKCS1_SHA512) {
         if (key.algorithm != keys.RSA) { ret BAD_SIGNATURE; }
         val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
             modulus:  key.first,
@@ -142,10 +150,16 @@ pub fun message(key: *keys.PublicKey, algorithm: x509.SignatureAlgorithm,
         or (algorithm == x509.RSA_PSS_SHA384) {
             status = signature.verify_rsa_pss_sha384(public_key, content, sig);
         }
+        or (algorithm == x509.RSA_PSS_SHA512) {
+            status = signature.verify_rsa_pss_sha512(public_key, content, sig);
+        }
         or (algorithm == x509.RSA_PKCS1_SHA256) {
             status = signature.verify_rsa_pkcs1_sha256(public_key, content, sig);
         }
-        or { status = signature.verify_rsa_pkcs1_sha384(public_key, content, sig); }
+        or (algorithm == x509.RSA_PKCS1_SHA384) {
+            status = signature.verify_rsa_pkcs1_sha384(public_key, content, sig);
+        }
+        or { status = signature.verify_rsa_pkcs1_sha512(public_key, content, sig); }
     }
     or                                   { ret UNSUPPORTED_ALGORITHM; }
     if (status == contracts.UNSUPPORTED) { ret UNSUPPORTED_ALGORITHM; }
@@ -708,8 +722,8 @@ test verify__validate_an_openssl_p_384_sha_384_server_path {
         ?parsed_leaf) != contracts.OK ||
         x509.parse_trust_anchor(contracts.Bytes{data: ?root_der[0], len: 526},
         ?parsed_root) != contracts.OK ||
-        parsed_leaf.signature_algorithm != x509.ECDSA_P384_SHA384 ||
-        parsed_root.signature_algorithm != x509.ECDSA_P384_SHA384 ||
+        parsed_leaf.signature_algorithm != x509.ECDSA_SHA384 ||
+        parsed_root.signature_algorithm != x509.ECDSA_SHA384 ||
         parsed_leaf.public_key.algorithm != keys.P384 ||
         parsed_root.public_key.algorithm != keys.P384 ||
         verify_signature(?parsed_leaf, ?parsed_root) != OK ||
@@ -818,5 +832,89 @@ test verify__enforce_constrained_intermediate_paths {
         ?parsed_leaf) != contracts.OK ||
         certificate_names_constrained(?parsed_leaf,
         parsed_intermediate.extensions.name_constraints)) { ret 4; }
+    ret 0;
+}
+
+# roots and leaves openssl signed, from test/interop/generate-digests.sh
+#[testing]
+#[embed("../test/vectors/digests/p384-root.der")]
+val P384_ROOT:             [551]u8;
+#[testing]
+#[embed("../test/vectors/digests/p384.der")]
+val P384_LEAF:             [565]u8;
+#[testing]
+#[embed("../test/vectors/digests/p521-root.der")]
+val P521_ROOT:             [626]u8;
+#[testing]
+#[embed("../test/vectors/digests/p521.der")]
+val P521_LEAF:             [640]u8;
+#[testing]
+#[embed("../test/vectors/digests/rsa-root.der")]
+val RSA512_ROOT:           [885]u8;
+#[testing]
+#[embed("../test/vectors/digests/rsa.der")]
+val RSA_PKCS1_SHA512_LEAF: [898]u8;
+#[testing]
+#[embed("../test/vectors/digests/rsa-pss.der")]
+val RSA_PSS_SHA512_LEAF:   [1006]u8;
+#[testing]
+#[embed("../test/vectors/digests/rsa-sha1.der")]
+val RSA_SHA1_LEAF:         [903]u8;
+#[testing]
+#[embed("../test/vectors/digests/p384-sha1.der")]
+val P384_SHA1_LEAF:        [568]u8;
+
+# a leaf under its root: the algorithms parse as expected, and the path
+# verifies to want
+#[testing]
+fun digest_path(leaf: *u8, leaf_len: usize, root: *u8, root_len: usize,
+    algorithm: x509.SignatureAlgorithm, key: keys.Algorithm, want: Error) i64 {
+    var parsed: x509.Certificate;
+    if (x509.parse(contracts.Bytes{data: leaf, len: leaf_len}, ?parsed) != contracts.OK ||
+        parsed.signature_algorithm != algorithm || parsed.public_key.algorithm != key) {
+        ret 1;
+    }
+    var certificates: [1]cert.Certificate = [1]cert.Certificate{
+        cert.Certificate{der: leaf, der_len: leaf_len},
+    };
+    var anchors: [1]cert.Certificate = [1]cert.Certificate{
+        cert.Certificate{der: root, der_len: root_len},
+    };
+    var presented: cert.Chain      = cert.Chain{certificates: ?certificates[0], len: 1};
+    var trust:     cert.TrustStore = cert.TrustStore{anchors: ?anchors[0], len: 1};
+    var options:   Options         = Options{
+        purpose:              email_protection(),
+        now:                  time.unix(1800000000, 0),
+        max_depth:            MAX_CHAIN_DEPTH,
+        max_signature_checks: MAX_SIGNATURE_CHECKS,
+    };
+    if (chain(?trust, ?presented, ?options) != want) { ret 2; }
+    ret 0;
+}
+
+test verify__digests_are_independent_of_the_curve {
+    # p-384 signing with sha-256, then p-521 with sha-512
+    if (digest_path(?P384_LEAF[0], 565, ?P384_ROOT[0], 551, x509.ECDSA_SHA256,
+        keys.P384, OK) != 0) { ret 1; }
+    if (digest_path(?P521_LEAF[0], 640, ?P521_ROOT[0], 626, x509.ECDSA_SHA512,
+        keys.P521, OK) != 0) { ret 2; }
+    ret 0;
+}
+
+test verify__rsa_sha_512_verifies_in_both_paddings {
+    if (digest_path(?RSA_PKCS1_SHA512_LEAF[0], 898, ?RSA512_ROOT[0], 885,
+        x509.RSA_PKCS1_SHA512, keys.RSA, OK) != 0) { ret 1; }
+    if (digest_path(?RSA_PSS_SHA512_LEAF[0], 1006, ?RSA512_ROOT[0], 885,
+        x509.RSA_PSS_SHA512, keys.RSA, OK) != 0) { ret 2; }
+    ret 0;
+}
+
+test verify__sha_1_signatures_are_weak_and_unsupported {
+    if (digest_path(?RSA_SHA1_LEAF[0], 903, ?RSA512_ROOT[0], 885, x509.RSA_PKCS1_SHA1,
+        keys.RSA, UNSUPPORTED_ALGORITHM) != 0) { ret 1; }
+    if (digest_path(?P384_SHA1_LEAF[0], 568, ?P384_ROOT[0], 551, x509.ECDSA_SHA1,
+        keys.P384, UNSUPPORTED_ALGORITHM) != 0) { ret 2; }
+    if (!x509.weak(x509.ECDSA_SHA1) || !x509.weak(x509.RSA_PKCS1_SHA1) ||
+        x509.weak(x509.ECDSA_SHA256)) { ret 3; }
     ret 0;
 }

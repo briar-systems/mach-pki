@@ -56,7 +56,7 @@ fun read(path: str, output: *Vector[u8]) bool {
 
 fun algorithm_named(name: str) x509.SignatureAlgorithm {
     if (str_equals(name, "ed25519")) { ret x509.ED25519; }
-    if (str_equals(name, "p256"))    { ret x509.ECDSA_P256_SHA256; }
+    if (str_equals(name, "p256"))    { ret x509.ECDSA_SHA256; }
     if (str_equals(name, "pss256"))  { ret x509.RSA_PSS_SHA256; }
     if (str_equals(name, "pss384"))  { ret x509.RSA_PSS_SHA384; }
     ret x509.SIGNATURE_NONE;
