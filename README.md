@@ -114,8 +114,11 @@ A `verify.Purpose` says what the leaf is accepted for: the key usage bits a leaf
 with a key usage extension must assert one of, and the extended key usage that
 the leaf and every intermediate carrying that extension must list, unless it
 lists any purpose. The constructors are `server_auth`, `client_auth`,
-`code_signing`, `email_protection`, `time_stamping`, and `document_signing`
-(RFC 9336). A caller builds its own for any other purpose.
+`code_signing`, `email_protection`, `time_stamping`, and `document_signing`.
+`document_signing` accepts what PDF validators accept: RFC 9336 document
+signing, `emailProtection`, Adobe Authentic Documents, or Microsoft document
+signing, besides no extended key usage or any purpose. A purpose lists such
+alternatives in `alternatives`. A caller builds its own for any other purpose.
 
 Intermediates must carry a critical CA basic constraint and, when key usage is
 present, `keyCertSign`. Path length excludes the leaf and self-issued rollover
