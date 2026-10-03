@@ -7,3 +7,4 @@ fwd pki.name;
 fwd pki.x509;
 fwd pki.load;
 fwd pki.verify;
+fwd pki.signer;
