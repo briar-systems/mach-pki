@@ -1,0 +1,99 @@
+# cms parsing and verification of an untrusted signed data
+
+use crypto.contracts;
+use pki.cert;
+use pki.cms;
+use path: pki.verify;
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.size.usize;
+
+use fuzz.verdict;
+
+fun flag(value: bool, bit: u64) u64 {
+    if (value) { ret 1::u64 << bit; }
+    ret 0;
+}
+
+fun signer_inside(info: *cms.SignerInfo, data: *u8, len: usize) bool {
+    ret verdict.bytes_inside(info.issuer, data, len) &&
+        verdict.bytes_inside(info.serial, data, len) &&
+        verdict.bytes_inside(info.key_id, data, len) &&
+        verdict.bytes_inside(info.signed_attributes, data, len) &&
+        verdict.bytes_inside(info.signature, data, len) &&
+        verdict.bytes_inside(info.signature_string.encoded, data, len) &&
+        verdict.bytes_inside(info.unsigned_attributes, data, len) &&
+        verdict.bytes_inside(info.message_digest, data, len) &&
+        verdict.bytes_inside(info.signing_certificate, data, len) &&
+        verdict.bytes_inside(info.encoded, data, len);
+}
+
+fun options(trust: *cert.TrustStore, form: cms.Content) cms.VerifyOptions {
+    var value: cms.VerifyOptions;
+    value.trust                      = trust;
+    value.chain.purpose              = path.email_protection();
+    value.chain.now                  = time.unix(1800000000, 0);
+    value.chain.max_depth            = path.MAX_CHAIN_DEPTH;
+    value.chain.max_signature_checks = path.MAX_SIGNATURE_CHECKS;
+    value.form                       = form;
+    ret value;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    val input:  contracts.Bytes = contracts.Bytes{data: data, len: len};
+    var value:  cms.SignedData;
+    val result: cms.Error       = cms.parse(input, ?value);
+    # the length of an element never reaches past the input
+    if (cms.encoded_length(input) > len) {
+        ret verdict.violated("cms: an element measures past its input");
+    }
+    if (result != cms.OK) { ret verdict.answered(result::u64); }
+    verdict.accept();
+    if (!verdict.bytes_inside(value.content_type, data, len) ||
+        !verdict.bytes_inside(value.content, data, len) ||
+        !verdict.bytes_inside(value.content_string.encoded, data, len) ||
+        !verdict.bytes_inside(value.certificates, data, len) ||
+        !verdict.bytes_inside(value.signer_infos, data, len) ||
+        !verdict.bytes_inside(value.fields, data, len)) {
+        ret verdict.violated("cms: an accepted signed data publishes a view outside its encoding");
+    }
+    var shape: u64 = (value.version::u64 << 8) | verdict.bucket(value.signer_count);
+    shape = verdict.mix(shape, flag(value.content_present, 0) |
+        flag(value.content_string.tag == 0x24, 1) | flag(value.certificates.len > 0, 2));
+    var trust: cert.TrustStore = cert.TrustStore{anchors: nil, len: 0};
+    var index: usize           = 0;
+    for (index < value.signer_count) {
+        var info:   cms.SignerInfo;
+        val signer: cms.Error = cms.signer_info(?value, index, ?info);
+        if (signer != cms.OK) {
+            shape = verdict.mix(shape, 0x100 | signer::u64);
+            index = index + 1;
+            cnt;
+        }
+        if (!signer_inside(?info, data, len)) {
+            ret verdict.violated("cms: an accepted signer publishes a view outside its encoding");
+        }
+        shape = verdict.mix(shape, (info.digest::u64 << 16) | (info.signature_algorithm::u64 << 8) |
+            flag(info.signature_string.tag == 0x24, 0) | flag(info.signed_attributes.len > 0, 1) |
+            flag(info.unsigned_attributes.len > 0, 2) | flag(info.key_id.len > 0, 3));
+        index = index + 1;
+    }
+    # the digest of an attached or detached content, and the signature, are read
+    # under every form, none of which can reach a trusted anchor
+    var form: cms.Content = cms.ATTACHED;
+    for (form <= cms.DETACHED_DIGEST) {
+        var verify: cms.VerifyOptions = options(?trust, form);
+        var digest: [cms.MAX_DIGEST_SIZE]u8;
+        var i:      usize             = 0;
+        for (i < cms.MAX_DIGEST_SIZE) {
+            digest[i] = i::u8;
+            i         = i + 1;
+        }
+        verify.content        = contracts.Bytes{data: data, len: len};
+        verify.content_digest = contracts.Bytes{data: ?digest[0], len: cms.MAX_DIGEST_SIZE};
+        val judged: cms.Verdict = cms.verify(input, ?verify, nil);
+        shape = verdict.mix(shape, (form::u64 << 8) | judged.error::u64);
+        form  = form + 1;
+    }
+    ret verdict.answered(verdict.mix(shape, 1::u64 << 41));
+}
