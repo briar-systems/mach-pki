@@ -344,7 +344,7 @@ fun open_fixture(fixture: *Fixture, key_pem: *u8, chain_pem: *u8) contract.Error
 #[testing]
 fun signs_and_verifies(value: *contract.Signer,
     wanted: x509.SignatureAlgorithm) bool {
-    var message: [11]u8          = [11]u8{'s', 'i', 'g', 'n', 'e', 'd', ' ', 'a', 't', 't', 'r'};
+    var message: [11]u8          = "signed attr";
     var output:  [512]u8;
     val made:    contract.Result = contract.sign(value, wanted,
         contracts.Bytes{data: ?message[0], len: 11},

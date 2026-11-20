@@ -200,7 +200,7 @@ test signer__a_signer_without_a_key_drops_in {
     val presented: cert.Chain = chain(?value);
     if (presented.len != 1 || presented.certificates[0].der != ?der[0]) { ret 2; }
 
-    var message: [5]u8           = [5]u8{'h', 'e', 'l', 'l', 'o'};
+    var message: [5]u8           = "hello";
     var output:  [104]u8;
     val bytes:   contracts.Bytes = contracts.Bytes{data: ?message[0], len: 5};
     val short:   Result          = sign(?value, x509.ECDSA_SHA384, bytes,
