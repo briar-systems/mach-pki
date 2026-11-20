@@ -24,7 +24,8 @@ certificate model. It depends on mach-std and mach-crypto only.
 - `pki.cms` builds CMS signed data through a signer, and parses and verifies
   it.
 
-`use pki;` binds `pki.lib.pki`, which re-exports these modules.
+`pki.lib.pki` is the library artifact's entry. A consumer imports each module
+by its own path, as below.
 
 ## Use
 
@@ -159,7 +160,7 @@ chain. Input and output storage must not overlap.
 `load.private_der` loads PKCS #8, SEC 1, or RSA PKCS #1 DER into an owned
 `crypto.encoding.keys.PrivateKey`, and `load.private_pem` accepts `PRIVATE
 KEY`, `EC PRIVATE KEY`, and `RSA PRIVATE KEY` blocks. The caller destroys the
-key with `crypto.encoding.keys.destroy_private`.
+key with `crypto.encoding.keys.private_dnit`.
 
 ## Signing
 
@@ -190,6 +191,7 @@ contract already names both.
 ```mach
 use crypto.contracts;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
 use pki.key_signer;
 use pki.signer;
 use pki.x509;
@@ -197,7 +199,7 @@ use pki.x509;
 # key_pem holds the private key, chain_pem the leaf-first chain, and tbs the
 # bytes to sign
 var der:   [16384]u8;
-var owner: secret.Allocator = secret.system_allocator();
+var owner: secret.Allocator = system_allocator.make();
 var keyed: key_signer.KeySigner;
 val opened: signer.Error = key_signer.open_pem(?keyed, key_pem, chain_pem,
     contracts.Buffer{data: ?der[0], capacity: 16384}, ?owner);

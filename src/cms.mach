@@ -17,7 +17,9 @@
 use crypto.contracts;
 use crypto.encoding.der;
 use crypto.hash;
+use crypto.hash.sha512;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
 use pki.ber;
 use pki.cert;
 use pki.key_signer;
@@ -26,7 +28,6 @@ use path:     pki.verify;
 use pki.writer;
 use pki.x509;
 use std.chrono.time;
-use std.crypto.hash.sha512;
 use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -334,13 +335,13 @@ pub fun digest_init(value: *Digest, algorithm: DigestAlgorithm) contracts.Error 
     value.algorithm = algorithm;
     if (algorithm == SHA256) {
         value.sha256 = hash.empty_sha256();
-        ret hash.init_sha256(?value.sha256);
+        ret hash.sha256_init(?value.sha256);
     }
     if (algorithm == SHA384) {
         value.sha384 = hash.empty_sha384();
-        ret hash.init_sha384(?value.sha384);
+        ret hash.sha384_init(?value.sha384);
     }
-    value.sha512 = sha512.init();
+    value.sha512 = sha512.make();
     ret contracts.OK;
 }
 
@@ -1311,7 +1312,7 @@ fun open_fixture(fixture: *Fixture, key_pem: *u8, key_len: usize, chain_pem: *u8
         key[i] = key_pem[i];
         i      = i + 1;
     }
-    fixture.owner = secret.system_allocator();
+    fixture.owner = system_allocator.make();
     val opened: contract.Error = key_signer.open_pem(?fixture.keyed,
         contracts.SecretBytes{data: ?key[0], len: key_len},
         contracts.Bytes{data: chain_pem, len: chain_len},

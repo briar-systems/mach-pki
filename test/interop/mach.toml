@@ -1,34 +1,30 @@
 [project]
 id = "interop"
 version = "0.0.0"
-mach = "^6.8"
+mach = "^7"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.interop]
 kind = "bin"
 entry = "bin/interop.mach"
-out = "bin/interop"
+out = "{project.work}/bin/interop{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -40,8 +36,8 @@ path = "../.."
 # a dependency it selects by version, and this tree is not committed
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v9.4.1"
+ref = "branch/dev"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.28.0"
+ref = "branch/dev"
