@@ -64,3 +64,7 @@ ref = "branch/dev"
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
 ref = "branch/dev"
+
+[dep.encoding]
+git = "https://github.com/briar-systems/mach-encoding"
+ref = "branch/dev"
