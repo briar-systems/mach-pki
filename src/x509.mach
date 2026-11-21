@@ -3,11 +3,11 @@
 use crypto.contracts;
 use crypto.encoding.der;
 use crypto.encoding.keys;
+use encoding.base64;
 use pki.name;
 use pki.writer;
 use std.chrono.date;
 use std.chrono.time;
-use std.encoding.base64;
 use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;

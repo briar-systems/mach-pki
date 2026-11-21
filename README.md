@@ -2,7 +2,7 @@
 
 X.509 certificates and CMS signed data for Mach: strict parsing, loading,
 certification path validation, signing, and signature verification. Parsing and validation borrow their input and allocate nothing. TLS, CMS and PDF signing share this one
-certificate model. It depends on mach-std and mach-crypto only.
+certificate model. It depends on mach-std, mach-crypto and mach-encoding only.
 
 ## Modules
 
