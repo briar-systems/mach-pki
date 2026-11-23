@@ -4,6 +4,7 @@ use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.encoding.pem;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
 use pki.cert;
 use pki.x509;
 use std.types.bool.bool;
@@ -221,7 +222,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
     ret false;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun decode_secret_hex(input: *u8, input_len: usize, output: *^u8,
     output_len: usize) bool {
@@ -288,7 +289,7 @@ test load__load_der_and_pem_private_key_containers {
     val key_hex: *u8 = "302e020100300506032b6570042204207e8382904986fb20533e917fee01ff4a2a1f85e8d24b9ded7f4eb5d4a64f8250"::*u8;
     var key_der: [48]^u8;
     if (!decode_secret_hex(key_hex, 96, ?key_der[0], 48)) { ret 1; }
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     var key:   keys.PrivateKey  = keys.empty_private();
     if (private_der(contracts.SecretBytes{data: ?key_der[0], len: 48},
         cert.PKCS8_DER, ?owner, ?key) != contracts.OK ||
@@ -297,10 +298,10 @@ test load__load_der_and_pem_private_key_containers {
     val pem_key: contracts.Operation = keys.encode_private_pem(?key,
         contracts.SecretBuffer{data: ?encoded[0], capacity: 256});
     if (pem_key.error != contracts.OK || pem_key.written == 0 ||
-        keys.destroy_private(?key) != contracts.OK) { ret 3; }
+        keys.private_dnit(?key) != contracts.OK) { ret 3; }
     var decoded: keys.PrivateKey = keys.empty_private();
     if (private_pem(contracts.SecretBytes{data: ?encoded[0], len: pem_key.written},
         ?owner, ?decoded) != contracts.OK || decoded.algorithm != keys.ED25519 ||
-        keys.destroy_private(?decoded) != contracts.OK) { ret 4; }
+        keys.private_dnit(?decoded) != contracts.OK) { ret 4; }
     ret 0;
 }

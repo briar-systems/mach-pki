@@ -10,6 +10,7 @@
 
 use crypto.contracts;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
 use pki.cert;
 use pki.cms;
 use pki.key_signer;
@@ -77,7 +78,7 @@ fun sign(key_path: str, chain_path: str, content_path: str, form: str, name: str
         i             = i + 1;
     }
     var der:    [16384]u8;
-    var owner:  secret.Allocator = secret.system_allocator();
+    var owner:  secret.Allocator = system_allocator.make();
     var keyed:  key_signer.KeySigner;
     val opened: signer.Error     = key_signer.open_pem(?keyed,
         contracts.SecretBytes{data: ?secret_key[0], len: key.len},

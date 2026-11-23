@@ -5,6 +5,8 @@ use crypto.encoding.keys;
 use crypto.group.p256;
 use crypto.secret;
 use crypto.signature;
+use system_allocator: crypto.system.allocator;
+use system_entropy:   crypto.system.entropy;
 use pki.cert;
 use pki.load;
 use contract: pki.signer;
@@ -159,9 +161,9 @@ fun sign_rsa(state: *KeyState, private_exponent: *^u8,
     output: contracts.Buffer) contracts.Operation {
     var salt_len: usize = signature.RSA_PSS_SHA256_SALT_SIZE;
     if (wanted == x509.RSA_PSS_SHA384) { salt_len = signature.RSA_PSS_SHA384_SALT_SIZE; }
-    var entropy: secret.Entropy = secret.system_entropy();
+    var entropy: secret.Entropy = system_entropy.make();
     var salt:    [48]^u8;
-    if (entropy.fill_fn(entropy.context, entropy.secret_context, ?salt[0],
+    if (entropy.fn_fill(entropy.context, entropy.secret_context, ?salt[0],
         salt_len) != 0) {
         ct.zeroize(?salt[0], 48);
         ret contracts.Operation{error: contracts.ENTROPY_UNAVAILABLE, written: 0};
@@ -230,7 +232,7 @@ pub fun open(output: *KeySigner, key: *keys.PrivateKey, chain: cert.Chain) contr
     opened.rsa_private = secret.empty();
     val prepared: contract.Error = prepare(?opened, ?leaf.public_key);
     if (prepared != contract.OK) {
-        secret.destroy(?opened.rsa_private);
+        secret.dnit(?opened.rsa_private);
         ret prepared;
     }
     var i: usize = 0;
@@ -265,7 +267,7 @@ pub fun open_pem(output: *KeySigner, key_pem: contracts.SecretBytes,
     if (decoded == contracts.UNSUPPORTED) { ret contract.UNSUPPORTED_ALGORITHM; }
     if (decoded != contracts.OK)          { ret contract.INVALID_INPUT; }
     val opened: contract.Error = open(output, ?key, chain);
-    if (opened != contract.OK) { keys.destroy_private(?key); }
+    if (opened != contract.OK) { keys.private_dnit(?key); }
     ret opened;
 }
 
@@ -274,8 +276,8 @@ pub fun close(value: *KeySigner) contract.Error {
     if (value == nil) { ret contract.INVALID_INPUT; }
     var empty: cert.Chain;
     value.state.chain = empty;
-    val padded: contracts.Error = secret.destroy(?value.rsa_private);
-    if (keys.destroy_private(?value.key) != contracts.OK || padded != contracts.OK) {
+    val padded: contracts.Error = secret.dnit(?value.rsa_private);
+    if (keys.private_dnit(?value.key) != contracts.OK || padded != contracts.OK) {
         ret contract.FAILED;
     }
     ret contract.OK;
@@ -329,7 +331,7 @@ fun open_fixture(fixture: *Fixture, key_pem: *u8, chain_pem: *u8) contract.Error
         key[i] = key_pem[i];
         i      = i + 1;
     }
-    fixture.owner = secret.system_allocator();
+    fixture.owner = system_allocator.make();
     val opened: contract.Error = open_pem(?fixture.signer,
         contracts.SecretBytes{data: ?key[0], len: key_len},
         contracts.Bytes{data: chain_pem, len: str_len(chain_pem)},
@@ -342,7 +344,7 @@ fun open_fixture(fixture: *Fixture, key_pem: *u8, chain_pem: *u8) contract.Error
 #[testing]
 fun signs_and_verifies(value: *contract.Signer,
     wanted: x509.SignatureAlgorithm) bool {
-    var message: [11]u8          = [11]u8{'s', 'i', 'g', 'n', 'e', 'd', ' ', 'a', 't', 't', 'r'};
+    var message: [11]u8          = "signed attr";
     var output:  [512]u8;
     val made:    contract.Result = contract.sign(value, wanted,
         contracts.Bytes{data: ?message[0], len: 11},
